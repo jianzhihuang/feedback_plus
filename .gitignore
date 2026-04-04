@@ -11,8 +11,8 @@ venv/
 dist/
 build/
 
-# Feedback images (可选：取消注释以忽略反馈图片)
-# feedback/
+# Feedback images
+feedback/
 
 # IDE
 .idea/
