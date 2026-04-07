@@ -175,10 +175,11 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     if not is_reuse:
         # 第一次：開啟瀏覽器
         if not open_feedback_page(url):
-            print(f'請在瀏覽器開啟回饋頁面: {url}')
+            print(f'請在瀏覽器開啟回饋頁面: {url}', flush=True)
     # 複用時：瀏覽器 tab 透過 JS 輪詢（每 1.5s）偵測 session_id 改變，自動重置表單
     # 不呼叫 open，因為會開新視窗/tab
 
+    print(f'⏳ 等待使用者在瀏覽器回饋… {url}', flush=True)
     return _wait_result(port, token, timeout, session_id)
 
 
