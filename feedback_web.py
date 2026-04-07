@@ -33,10 +33,25 @@ def _project_key() -> str:
     3. 往上找專案標記檔（package.json / pyproject.toml / go.mod 等）
     4. CWD（fallback）
     """
-    # 1. 環境變數覆蓋
+    # 0. 內部使用：client 把自己的 key 直接傳給 daemon（繞過 re-hash 問題）
+    precomputed = os.environ.get('_FEEDBACK_KEY', '').strip()
+    if precomputed:
+        return precomputed
+
+    # 1. 環境變數覆蓋（使用者手動指定）
     env_key = os.environ.get('FEEDBACK_PROJECT_KEY', '').strip()
     if env_key:
         return hashlib.md5(env_key.encode()).hexdigest()[:8]
+
+    # 1.5. TTY 隔離：不同 terminal tab → 不同 port，不互相干擾
+    #       若無 TTY（管道/CI）則跳過，沿用舊行為
+    def _tty_suffix() -> str:
+        try:
+            return os.ttyname(sys.stdin.fileno())
+        except (AttributeError, OSError):
+            return ''
+
+    tty = _tty_suffix()
 
     # 2. git root
     try:
@@ -45,7 +60,8 @@ def _project_key() -> str:
             capture_output=True, text=True, timeout=2,
         )
         if r.returncode == 0 and r.stdout.strip():
-            return hashlib.md5(r.stdout.strip().encode()).hexdigest()[:8]
+            raw = r.stdout.strip() + tty
+            return hashlib.md5(raw.encode()).hexdigest()[:8]
     except Exception:
         pass
 
@@ -60,14 +76,16 @@ def _project_key() -> str:
     candidate = cwd
     while True:
         if any((candidate / m).exists() for m in _MARKERS):
-            return hashlib.md5(str(candidate).encode()).hexdigest()[:8]
+            raw = str(candidate) + tty
+            return hashlib.md5(raw.encode()).hexdigest()[:8]
         parent = candidate.parent
         if parent == candidate or candidate == home:
             break
         candidate = parent
 
     # 4. CWD fallback
-    return hashlib.md5(str(cwd).encode()).hexdigest()[:8]
+    raw = str(cwd) + tty
+    return hashlib.md5(raw.encode()).hexdigest()[:8]
 
 
 def _preferred_port(key: str) -> int:
@@ -146,6 +164,9 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     feedback_dir = Path.cwd() / 'feedback'
     feedback_dir.mkdir(exist_ok=True)
 
+    # 預先計算 key（含 TTY），確保 client 與 daemon 使用同一個 key
+    my_key = _project_key()
+
     state = _read_state()
     port, token = None, None
     is_reuse = False
@@ -162,7 +183,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
                 port = None
 
     if port is None:
-        port, token = _spawn_daemon(feedback_dir)
+        port, token = _spawn_daemon(feedback_dir, my_key)
 
     # 啟動新一輪回饋（取得 session_id）
     try:
@@ -185,7 +206,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 
 # ── Client internals ───────────────────────────────────────────────────────────
 
-def _spawn_daemon(feedback_dir: Path):
+def _spawn_daemon(feedback_dir: Path, project_key: str = ''):
     """啟動獨立 daemon 伺服器，回傳 (port, token)。"""
     try:
         _state_path(feedback_dir).unlink()
@@ -206,6 +227,12 @@ def _spawn_daemon(feedback_dir: Path):
         kw['creationflags'] = 0x00000008  # DETACHED_PROCESS
     else:
         kw['start_new_session'] = True
+
+    # 把 client 的 project_key 直接傳給 daemon（避免 re-hash）
+    if project_key:
+        env = os.environ.copy()
+        env['_FEEDBACK_KEY'] = project_key
+        kw['env'] = env
 
     subprocess.Popen(cmd, **kw)
 
@@ -278,16 +305,35 @@ def _run_daemon(feedback_dir: Path) -> None:
         'history': _load_history(feedback_dir),  # 從檔案載入歷史
         'image_counter': 0,
         'timeout': 0,        # 本輪 timeout 秒數（0=無限制）
+        'pending_queue': [],  # [{sid, summary, timeout}] — 多 session 排隊
     }
+
+    def _activate_next() -> None:
+        """從 pending_queue 取出下一個 session 並啟動。必須在 lock 內呼叫。"""
+        if shared['pending_queue']:
+            nxt = shared['pending_queue'].pop(0)
+            shared['session_id'] = nxt['sid']
+            shared['summary'] = nxt['summary']
+            shared['status'] = 'active'
+            shared['feedback'] = []
+            shared['timeout'] = nxt['timeout']
 
     def reset_session(summary: str, timeout: int = 0) -> str:
         sid = str(uuid.uuid4())
         with shared['lock']:
-            shared['session_id'] = sid
-            shared['summary'] = summary
-            shared['status'] = 'active'
-            shared['feedback'] = []
-            shared['timeout'] = max(0, int(timeout))
+            if shared['status'] == 'active':
+                # 已有 session 進行中 → 排隊等待，不覆蓋
+                shared['pending_queue'].append({
+                    'sid': sid,
+                    'summary': summary,
+                    'timeout': max(0, int(timeout)),
+                })
+            else:
+                shared['session_id'] = sid
+                shared['summary'] = summary
+                shared['status'] = 'active'
+                shared['feedback'] = []
+                shared['timeout'] = max(0, int(timeout))
         return sid
 
     def store_result(sid: str, feedback: list) -> None:
@@ -419,6 +465,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         <span class="chip">本機頁面</span>
         <span class="chip">圖片會存到 feedback 資料夾</span>
         <span class="chip" id="countChip">目前 0 項回饋</span>
+        <span class="chip hidden" id="queueChip" style="background:rgba(255,200,80,.25);border-color:rgba(255,200,80,.4)">⏳ 1 個 session 排隊中</span>
       </div>
     </section>
 
@@ -480,6 +527,7 @@ def _run_daemon(feedback_dir: Path) -> None:
     const statusText   = document.getElementById("statusText");
     const statusHint   = document.getElementById("statusHint");
     const countChip    = document.getElementById("countChip");
+    const queueChip    = document.getElementById("queueChip");
     const doneBox      = document.getElementById("doneBox");
     const dropzone     = document.getElementById("dropzone");
     const summaryContent = document.getElementById("summaryContent");
@@ -496,9 +544,10 @@ def _run_daemon(feedback_dir: Path) -> None:
       let remaining = timeoutSec;
       waitTimer.classList.remove('hidden');
       function tick() {{
-        const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
+        const hh = String(Math.floor(remaining / 3600)).padStart(2, '0');
+        const mm = String(Math.floor((remaining % 3600) / 60)).padStart(2, '0');
         const ss = String(remaining % 60).padStart(2, '0');
-        waitTimer.textContent = `⏱ 剩餘 ${{mm}}:${{ss}}`;
+        waitTimer.textContent = `⏱ 剩餘 ${{hh}}:${{mm}}:${{ss}}`;
         if (remaining <= 0) {{
           clearInterval(_timerInterval);
           cancelFeedback();
@@ -726,6 +775,13 @@ def _run_daemon(feedback_dir: Path) -> None:
           currentSessionId = data.session_id;
           resetForm(data.summary || '', data.timeout || 0);
         }}
+        const qlen = data.queue_length || 0;
+        if (qlen > 0) {{
+          queueChip.textContent = `⏳ ${{qlen}} 個 session 排隊中`;
+          queueChip.classList.remove('hidden');
+        }} else {{
+          queueChip.classList.add('hidden');
+        }}
       }} catch (_) {{}}
     }}, 1500);
     // ─────────────────────────────────────────────────────────────────────────
@@ -837,6 +893,7 @@ def _run_daemon(feedback_dir: Path) -> None:
                         'summary': shared['summary'],
                         'status': shared['status'],
                         'timeout': shared['timeout'],
+                        'queue_length': len(shared['pending_queue']),
                     })
                 return
             if self.path.startswith('/api/history'):
@@ -915,26 +972,48 @@ def _run_daemon(feedback_dir: Path) -> None:
                 if text:
                     items.append({'type': 'text', 'content': text,
                                   'timestamp': datetime.now().isoformat()})
+                # Bug fix: re-check under lock before committing — cancel may have
+                # already advanced the queue between the first check and here.
+                _summary = ''
                 with shared['lock']:
+                    if shared['session_id'] != caller_sid or shared['status'] != 'active':
+                        self.send_json(409, {'ok': False, 'error': '會話已被取消，請等待 AI 下次呼叫'})
+                        return
+                    _summary = shared['summary']
                     shared['feedback'] = items
                     shared['status'] = 'done'
+                    _activate_next()  # atomic: state change + queue advance under one lock
                 store_result(caller_sid, items)
-                with shared['lock']:
-                    _summary = shared['summary']
                 append_history(caller_sid, _summary, items, False)
                 self.send_json(200, {'ok': True, 'count': len(items)})
                 return
 
             if self.path == '/api/cancel':
                 caller_sid = payload.get('session_id', '')
+                _summary = ''
+                was_active = False
+                was_queued = False
                 with shared['lock']:
                     if shared['session_id'] == caller_sid and shared['status'] == 'active':
+                        # Active session cancelled → mark done and advance queue
+                        _summary = shared['summary']
                         shared['feedback'] = []
                         shared['status'] = 'done'
-                store_result(caller_sid, [])
-                with shared['lock']:
-                    _summary = shared['summary']
-                append_history(caller_sid, _summary, [], True)
+                        _activate_next()
+                        was_active = True
+                    else:
+                        # Queued session cancelled → just remove from queue
+                        orig_len = len(shared['pending_queue'])
+                        shared['pending_queue'] = [
+                            e for e in shared['pending_queue'] if e['sid'] != caller_sid
+                        ]
+                        was_queued = len(shared['pending_queue']) < orig_len
+                # Only store/log when we actually acted — avoid overwriting real feedback
+                # from a completed submit with [] from a stale timeout-cancel.
+                if was_active or was_queued:
+                    store_result(caller_sid, [])
+                if was_active:
+                    append_history(caller_sid, _summary, [], True)
                 self.send_json(200, {'ok': True})
                 return
 

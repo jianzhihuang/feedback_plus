@@ -108,7 +108,7 @@ def main():
     mode_group.add_argument('--gui', action='store_true', help='使用Web模式（支援圖片）')
     
     parser.add_argument('--summary', '-s', type=str, default='', help='AI工作摘要')
-    parser.add_argument('--timeout', '-t', type=int, default=6000, help='超時時間（秒）')
+    parser.add_argument('--timeout', '-t', type=int, default=0, help='超時時間（秒），0 代表無限制')
     
     args = parser.parse_args()
     
