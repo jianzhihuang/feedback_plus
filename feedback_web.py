@@ -43,16 +43,6 @@ def _project_key() -> str:
     if env_key:
         return hashlib.md5(env_key.encode()).hexdigest()[:8]
 
-    # 1.5. TTY 隔離：不同 terminal tab → 不同 port，不互相干擾
-    #       若無 TTY（管道/CI）則跳過，沿用舊行為
-    def _tty_suffix() -> str:
-        try:
-            return os.ttyname(sys.stdin.fileno())
-        except (AttributeError, OSError):
-            return ''
-
-    tty = _tty_suffix()
-
     # 2. git root
     try:
         r = subprocess.run(
@@ -60,8 +50,7 @@ def _project_key() -> str:
             capture_output=True, text=True, timeout=2,
         )
         if r.returncode == 0 and r.stdout.strip():
-            raw = r.stdout.strip() + tty
-            return hashlib.md5(raw.encode()).hexdigest()[:8]
+            return hashlib.md5(r.stdout.strip().encode()).hexdigest()[:8]
     except Exception:
         pass
 
@@ -76,16 +65,14 @@ def _project_key() -> str:
     candidate = cwd
     while True:
         if any((candidate / m).exists() for m in _MARKERS):
-            raw = str(candidate) + tty
-            return hashlib.md5(raw.encode()).hexdigest()[:8]
+            return hashlib.md5(str(candidate).encode()).hexdigest()[:8]
         parent = candidate.parent
         if parent == candidate or candidate == home:
             break
         candidate = parent
 
     # 4. CWD fallback
-    raw = str(cwd) + tty
-    return hashlib.md5(raw.encode()).hexdigest()[:8]
+    return hashlib.md5(str(cwd).encode()).hexdigest()[:8]
 
 
 def _preferred_port(key: str) -> int:
