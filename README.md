@@ -244,6 +244,42 @@ python ai_feedback_tool_blocking.py --gui --summary "AI任務摘要" --timeout 9
 
 ---
 
+## 💡 為什麼選擇 CLI 而非 MCP？
+
+本工具早期曾以 MCP（Model Context Protocol）方式整合，後改為 **Shell CLI 呼叫**。原因如下：
+
+### MCP 的 Token 消耗問題
+
+MCP 整合時，AI 每次對話開始都必須將**所有工具的 schema 定義**載入 context window：
+
+```
+6 個 MCP server × 10 個工具 ≈ 47,000 tokens（尚未做任何事）
+```
+
+加上每次工具呼叫的 JSON-RPC 協議包裝：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"...","arguments":{...}}}
+```
+
+| 方式 | 10 次工具呼叫 token 消耗 |
+|------|--------------------------|
+| MCP  | ~600 tokens（含 schema 預載可達數萬） |
+| CLI  | ~300 tokens |
+
+Vercel 工程師實測：將 MCP 工具換成 bash + filesystem，**每次呼叫費用從 $1.00 降至 $0.25（省 75%）**。
+
+### CLI 的優勢
+
+- ✅ **零 schema 預載**：不需預先定義工具格式
+- ✅ **只有 stdout 計入 token**：沒有 JSON-RPC wrapper overhead
+- ✅ **對高頻呼叫工具效益最大**：feedback_plus 是反覆呼叫的工具，每次省下的 token 持續累積
+- ✅ **無需 IDE 設定**：任何能執行 shell 的 AI 環境均可使用
+
+> **結論**：對於 feedback_plus 這種需要在對話中反覆呼叫的工具，CLI 方式在 token 效率上遠優於 MCP。
+
+---
+
 ## 📝 License
 
 MIT License
