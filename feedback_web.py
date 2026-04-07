@@ -122,13 +122,8 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
         # 第一次：開啟瀏覽器
         if not open_feedback_page(url):
             print(f'請在瀏覽器開啟回饋頁面: {url}')
-    else:
-        # 複用：瀏覽器 tab 透過 JS 輪詢自動重置，僅在 macOS 嘗試 focus
-        if sys.platform == 'darwin':
-            try:
-                subprocess.Popen(['open', url])
-            except Exception:
-                pass
+    # 複用時：瀏覽器 tab 透過 JS 輪詢（每 1.5s）偵測 session_id 改變，自動重置表單
+    # 不呼叫 open，因為會開新視窗/tab
 
     return _wait_result(port, token, timeout, session_id)
 
