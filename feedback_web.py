@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -96,10 +97,10 @@ def _read_state(_feedback_dir: Path = None):
 
 
 def _write_state(_feedback_dir: Path, port: int, token: str,
-                 instance_id: str) -> None:
+                 instance_id: str, pid: int = 0) -> None:
     _state_path().write_text(
         json.dumps({'port': port, 'token': token,
-                    'instance_id': instance_id}),
+                    'instance_id': instance_id, 'pid': pid}),
         'utf-8',
     )
 
@@ -110,6 +111,25 @@ def _alive(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process with given PID is running."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # Process exists but we can't signal it
+
+
+def _lock_path() -> Path:
+    """Per-project spawn lock file path (prevents concurrent daemon spawns)."""
+    _GLOBAL_STATE_DIR.mkdir(exist_ok=True)
+    return _GLOBAL_STATE_DIR / f'{_project_key()}.lock'
 
 
 def _request(port: int, token: str, method: str, path: str, body=None) -> dict:
@@ -194,45 +214,80 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 # ── Client internals ───────────────────────────────────────────────────────────
 
 def _spawn_daemon(feedback_dir: Path, project_key: str = ''):
-    """啟動獨立 daemon 伺服器，回傳 (port, token)。"""
+    """啟動獨立 daemon 伺服器，回傳 (port, token)。
+
+    使用 per-project file lock 確保 singleton：同時只能有一個 spawn 流程進行。
+    """
+    lock_file = _lock_path()
+    lock_fd = open(lock_file, 'w')
     try:
-        _state_path(feedback_dir).unlink()
-    except FileNotFoundError:
-        pass
+        if os.name != 'nt':
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        '--daemon',
-        '--feedback-dir', str(feedback_dir),
-    ]
-    kw = {
-        'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
-        'stdin': subprocess.DEVNULL, 'close_fds': True,
-    }
-    if os.name == 'nt':
-        kw['creationflags'] = 0x00000008  # DETACHED_PROCESS
-    else:
-        kw['start_new_session'] = True
-
-    # 把 client 的 project_key 直接傳給 daemon（避免 re-hash）
-    if project_key:
-        env = os.environ.copy()
-        env['_FEEDBACK_KEY'] = project_key
-        kw['env'] = env
-
-    subprocess.Popen(cmd, **kw)
-
-    deadline = time.monotonic() + _DAEMON_STARTUP_TIMEOUT
-    while time.monotonic() < deadline:
-        s = _read_state(feedback_dir)
-        if s:
-            p, t = s.get('port', 0), s.get('token', '')
+        # Re-read state under lock — another process may have just spawned a daemon.
+        state = _read_state(feedback_dir)
+        if state:
+            p, t = state.get('port', 0), state.get('token', '')
             if p and t and _alive(p):
-                return p, t
-        time.sleep(0.1)
+                try:
+                    _request(p, t, 'GET', '/api/ping')
+                    return p, t
+                except Exception:
+                    pass
 
-    raise RuntimeError('回饋伺服器啟動逾時（5 秒）')
+        # Need to spawn. Terminate old daemon via PID so it releases the preferred port.
+        if state:
+            old_pid = state.get('pid', 0)
+            if old_pid and _pid_alive(old_pid):
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(0.4)  # Allow TIME_WAIT to clear
+                except Exception:
+                    pass
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            '--daemon',
+            '--feedback-dir', str(feedback_dir),
+        ]
+        kw = {
+            'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
+            'stdin': subprocess.DEVNULL, 'close_fds': True,
+        }
+        if os.name == 'nt':
+            kw['creationflags'] = 0x00000008  # DETACHED_PROCESS
+        else:
+            kw['start_new_session'] = True
+
+        # Pass client's project_key directly to daemon (avoids re-hash mismatch)
+        if project_key:
+            env = os.environ.copy()
+            env['_FEEDBACK_KEY'] = project_key
+            kw['env'] = env
+
+        subprocess.Popen(cmd, **kw)
+
+        deadline = time.monotonic() + _DAEMON_STARTUP_TIMEOUT
+        while time.monotonic() < deadline:
+            s = _read_state(feedback_dir)
+            if s:
+                p, t = s.get('port', 0), s.get('token', '')
+                if p and t and _alive(p):
+                    try:
+                        _request(p, t, 'GET', '/api/ping')
+                        return p, t
+                    except Exception:
+                        pass
+            time.sleep(0.1)
+
+        raise RuntimeError('回饋伺服器啟動逾時（5 秒）')
+    finally:
+        if os.name != 'nt':
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 def _wait_result(port: int, token: str, timeout: int, session_id: str) -> list:
@@ -1006,13 +1061,47 @@ def _run_daemon(feedback_dir: Path) -> None:
 
             self.send_json(404, {'ok': False, 'error': 'Not found'})
 
-    # ── 啟動伺服器（優先固定 port，被佔用則 fallback 隨機）──────────────────────
-    try:
-        server = ThreadingHTTPServer(('127.0.0.1', _preferred_port(_project_key())), Handler)
-    except OSError:
-        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    # ── Singleton check: exit if another live daemon already owns this project ──
+    preferred_port = _preferred_port(_project_key())
+    existing = _read_state()
+    if existing:
+        existing_pid = existing.get('pid', 0)
+        if existing_pid and _pid_alive(existing_pid):
+            sys.exit(0)  # Yield to the existing daemon
+
+    # ── Bind preferred port (retry for TIME_WAIT recovery) ────────────────────
+    server = None
+    for attempt in range(4):
+        try:
+            server = ThreadingHTTPServer(('127.0.0.1', preferred_port), Handler)
+            break
+        except OSError:
+            if attempt < 3:
+                time.sleep(0.4)
+
+    if server is None:
+        # Preferred port still busy — check if a peer daemon just won the race
+        time.sleep(0.2)
+        existing = _read_state()
+        if existing and _pid_alive(existing.get('pid', 0)):
+            sys.exit(0)
+        sys.exit(1)  # Port occupied by unrelated process; client will retry
+
     server.daemon_threads = True
-    _write_state(feedback_dir, server.server_port, token, instance_id)
+    my_pid = os.getpid()
+    _write_state(feedback_dir, server.server_port, token, instance_id, my_pid)
+
+    # ── Retirement watchdog: exit if state no longer points to this instance ──
+    def _retirement_watchdog():
+        while True:
+            time.sleep(15)
+            s = _read_state()
+            if s and s.get('instance_id') != instance_id:
+                os.kill(my_pid, signal.SIGTERM)
+                break
+
+    threading.Thread(target=_retirement_watchdog, daemon=True).start()
+
     server.serve_forever()
 
 
