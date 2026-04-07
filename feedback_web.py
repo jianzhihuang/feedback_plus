@@ -35,6 +35,8 @@ def _session_discriminator() -> str:
     return (
         os.environ.get('TERM_SESSION_ID') or       # macOS Terminal.app（每個分頁不同）
         os.environ.get('ITERM_SESSION_ID') or      # iTerm2
+        os.environ.get('WT_SESSION') or            # Windows Terminal（每個 tab/pane 不同）
+        os.environ.get('ConEmuPID') or             # ConEmu / ConEmuX
         (os.environ.get('TMUX', '').split(',')[1:2] or [''])[0]  # tmux pane ID
     )
 
