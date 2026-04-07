@@ -526,7 +526,7 @@ def _run_daemon(feedback_dir: Path) -> None:
       historyContent.classList.remove('hidden'); summaryContent.classList.add('hidden');
       historyContent.innerHTML = '<div class="history-empty">載入中…</div>';
       try {{
-        const resp = await fetch(`/api/history?page=${{page}}&per_page=20`, {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
+        const resp = await fetch(`/api/history?page=${{page}}&per_page=10`, {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
         const data = await resp.json();
         _historyPage = data.page || 1;
         renderHistory(data.history || [], data.page, data.pages, data.total);
