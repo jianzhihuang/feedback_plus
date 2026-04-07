@@ -159,6 +159,12 @@ python C:/Users/hp/software/MCP/ai_feedback_tool_blocking.py --cli --summary "�
 
 ---
 
+## 📸 介面預覽
+
+![Web 回饋介面](docs/screenshot-web-ui.png)
+
+---
+
 ## 功能特性
 
 - **雙模式支援**:
