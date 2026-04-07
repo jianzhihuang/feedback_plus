@@ -111,8 +111,9 @@ def main():
     parser.add_argument('--timeout', '-t', type=int, default=99999, help='超時時間（秒），0 代表無限制')
     
     args = parser.parse_args()
-    
-    # 收集回饋
+
+    # Convert literal \n from shell args into real newlines
+    args.summary = args.summary.replace('\\n', '\n')
     if args.gui:
         feedback = collect_feedback_gui(summary=args.summary, timeout=args.timeout)
     else:
