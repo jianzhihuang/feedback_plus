@@ -26,6 +26,19 @@ _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
 _GLOBAL_STATE_DIR = Path.home() / '.feedback_plus'
 
 
+def _session_discriminator() -> str:
+    """
+    回傳穩定的 terminal session 識別符，用於多視窗 port 隔離。
+    這些是 terminal emulator 在開新分頁時設定的環境變數，
+    會被所有子程序繼承，在整個 session 內穩定不變（不受 Copilot CLI 建立新 PTY 影響）。
+    """
+    return (
+        os.environ.get('TERM_SESSION_ID') or       # macOS Terminal.app（每個分頁不同）
+        os.environ.get('ITERM_SESSION_ID') or      # iTerm2
+        (os.environ.get('TMUX', '').split(',')[1:2] or [''])[0]  # tmux pane ID
+    )
+
+
 def _project_key() -> str:
     """
     專案識別碼（優先順序）：
@@ -33,6 +46,8 @@ def _project_key() -> str:
     2. git rev-parse --show-toplevel（git 專案）
     3. 往上找專案標記檔（package.json / pyproject.toml / go.mod 等）
     4. CWD（fallback）
+
+    最終以 terminal session 識別符做 suffix，實現多視窗 port 隔離。
     """
     # 0. 內部使用：client 把自己的 key 直接傳給 daemon（繞過 re-hash 問題）
     precomputed = os.environ.get('_FEEDBACK_KEY', '').strip()
@@ -42,9 +57,20 @@ def _project_key() -> str:
     # 1. 環境變數覆蓋（使用者手動指定）
     env_key = os.environ.get('FEEDBACK_PROJECT_KEY', '').strip()
     if env_key:
-        return hashlib.md5(env_key.encode()).hexdigest()[:8]
+        base = hashlib.md5(env_key.encode()).hexdigest()[:8]
+    else:
+        base = _compute_base_key()
 
-    # 2. git root
+    # 以 terminal session ID 做隔離（不同視窗/分頁 → 不同 port）
+    disc = _session_discriminator()
+    if disc:
+        return hashlib.md5(f'{base}:{disc}'.encode()).hexdigest()[:8]
+    return base
+
+
+def _compute_base_key() -> str:
+    """計算基底 key（git root → 標記檔 → CWD）。"""
+    # git root
     try:
         r = subprocess.run(
             ['git', 'rev-parse', '--show-toplevel'],
@@ -55,7 +81,7 @@ def _project_key() -> str:
     except Exception:
         pass
 
-    # 3. 找專案標記檔（往上至 home 或 /）
+    # 找專案標記檔（往上至 home 或 /）
     _MARKERS = {
         'package.json', 'pyproject.toml', 'setup.py', 'setup.cfg',
         'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle',
@@ -72,7 +98,7 @@ def _project_key() -> str:
             break
         candidate = parent
 
-    # 4. CWD fallback
+    # CWD fallback
     return hashlib.md5(str(cwd).encode()).hexdigest()[:8]
 
 
