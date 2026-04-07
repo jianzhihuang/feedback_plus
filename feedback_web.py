@@ -393,6 +393,11 @@ def _run_daemon(feedback_dir: Path) -> None:
     .history-list{{display:grid;gap:10px;margin-top:4px}}
     .history-empty{{color:var(--muted);font-size:14px;padding:20px 0;text-align:center}}
     .history-entry{{padding:14px 16px;border-radius:14px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f4f8fc 100%);display:grid;gap:6px}}
+    .history-pager{{display:flex;align-items:center;justify-content:center;gap:14px;padding:12px 0 4px}}
+    .pager-btn{{padding:5px 16px;border-radius:8px;border:1px solid #c0d4e8;background:#f0f6fc;color:#1565a0;font-size:13px;cursor:pointer}}
+    .pager-btn:disabled{{opacity:.4;cursor:default}}
+    .pager-btn:not(:disabled):hover{{background:#d8ebfc}}
+    .pager-info{{font-size:13px;color:var(--muted)}}
     .history-row{{display:flex;justify-content:space-between;align-items:center;gap:8px}}
     .history-time{{font-size:12px;color:var(--muted);letter-spacing:.04em}}
     .history-summary{{font-size:13px;color:var(--muted);white-space:pre-wrap;word-break:break-word;line-height:1.5;max-height:58px;overflow:hidden}}
@@ -513,22 +518,27 @@ def _run_daemon(feedback_dir: Path) -> None:
       tabSummary.classList.add('tab-active'); tabHistory.classList.remove('tab-active');
       summaryContent.classList.remove('hidden'); historyContent.classList.add('hidden');
     }});
-    tabHistory.addEventListener('click', async () => {{
+    tabHistory.addEventListener('click', () => loadHistoryPage(1));
+
+    let _historyPage = 1;
+    async function loadHistoryPage(page) {{
       tabHistory.classList.add('tab-active'); tabSummary.classList.remove('tab-active');
       historyContent.classList.remove('hidden'); summaryContent.classList.add('hidden');
       historyContent.innerHTML = '<div class="history-empty">載入中…</div>';
       try {{
-        const resp = await fetch('/api/history', {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
+        const resp = await fetch(`/api/history?page=${{page}}&per_page=20`, {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
         const data = await resp.json();
-        renderHistory(data.history || []);
+        _historyPage = data.page || 1;
+        renderHistory(data.history || [], data.page, data.pages, data.total);
       }} catch(_) {{ historyContent.innerHTML = '<div class="history-empty">載入失敗</div>'; }}
-    }});
-    function renderHistory(entries) {{
+    }}
+
+    function renderHistory(entries, page, pages, total) {{
       if (!entries.length) {{
         historyContent.innerHTML = '<div class="history-empty">尚無紀錄。</div>';
         return;
       }}
-      const items = [...entries].reverse().map(e => {{
+      const items = entries.map(e => {{
         const timeStr = new Date(e.timestamp).toLocaleString('zh-TW', {{hour12:false}});
         const tag = e.cancelled
           ? '<span class="htag htag-cancel">已取消</span>'
@@ -544,7 +554,13 @@ def _run_daemon(feedback_dir: Path) -> None:
           ${{summaryPart}}${{feedbackPart}}
         </div>`;
       }}).join('');
-      historyContent.innerHTML = `<div class="history-list">${{items}}</div>`;
+      const pagination = pages > 1 ? `
+        <div class="history-pager">
+          <button class="pager-btn" ${{page<=1?'disabled':''}} onclick="loadHistoryPage(${{page-1}})">‹ 上一頁</button>
+          <span class="pager-info">第 ${{page}} / ${{pages}} 頁（共 ${{total}} 筆）</span>
+          <button class="pager-btn" ${{page>=pages?'disabled':''}} onclick="loadHistoryPage(${{page+1}})">下一頁 ›</button>
+        </div>` : '';
+      historyContent.innerHTML = `<div class="history-list">${{items}}</div>${{pagination}}`;
     }}
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -823,10 +839,22 @@ def _run_daemon(feedback_dir: Path) -> None:
                         'timeout': shared['timeout'],
                     })
                 return
-            if self.path == '/api/history':
+            if self.path.startswith('/api/history'):
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                per_page = int(qs.get('per_page', ['20'])[0])
+                page = int(qs.get('page', ['1'])[0])
                 with shared['lock']:
                     h_copy = list(shared['history'])
-                self.send_json(200, {'history': h_copy})
+                total = len(h_copy)
+                pages = max(1, (total + per_page - 1) // per_page)
+                page = max(1, min(page, pages))
+                start = (page - 1) * per_page
+                chunk = list(reversed(h_copy))[start: start + per_page]
+                self.send_json(200, {
+                    'history': chunk, 'total': total,
+                    'page': page, 'pages': pages, 'per_page': per_page,
+                })
                 return
             if self.path.startswith('/api/result/'):
                 sid = self.path[len('/api/result/'):]
