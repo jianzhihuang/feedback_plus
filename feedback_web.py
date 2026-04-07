@@ -26,16 +26,48 @@ _GLOBAL_STATE_DIR = Path.home() / '.feedback_plus'
 
 
 def _project_key() -> str:
-    """以 git root（或 CWD）的 hash 作為專案識別碼，確保同專案共用同一 daemon。"""
+    """
+    專案識別碼（優先順序）：
+    1. 環境變數 FEEDBACK_PROJECT_KEY（使用者手動指定）
+    2. git rev-parse --show-toplevel（git 專案）
+    3. 往上找專案標記檔（package.json / pyproject.toml / go.mod 等）
+    4. CWD（fallback）
+    """
+    # 1. 環境變數覆蓋
+    env_key = os.environ.get('FEEDBACK_PROJECT_KEY', '').strip()
+    if env_key:
+        return hashlib.md5(env_key.encode()).hexdigest()[:8]
+
+    # 2. git root
     try:
         r = subprocess.run(
             ['git', 'rev-parse', '--show-toplevel'],
             capture_output=True, text=True, timeout=2,
         )
-        root = r.stdout.strip() if r.returncode == 0 else str(Path.cwd())
+        if r.returncode == 0 and r.stdout.strip():
+            return hashlib.md5(r.stdout.strip().encode()).hexdigest()[:8]
     except Exception:
-        root = str(Path.cwd())
-    return hashlib.md5(root.encode()).hexdigest()[:8]
+        pass
+
+    # 3. 找專案標記檔（往上至 home 或 /）
+    _MARKERS = {
+        'package.json', 'pyproject.toml', 'setup.py', 'setup.cfg',
+        'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle',
+        'Makefile', 'CMakeLists.txt', 'composer.json',
+    }
+    cwd = Path.cwd()
+    home = Path.home()
+    candidate = cwd
+    while True:
+        if any((candidate / m).exists() for m in _MARKERS):
+            return hashlib.md5(str(candidate).encode()).hexdigest()[:8]
+        parent = candidate.parent
+        if parent == candidate or candidate == home:
+            break
+        candidate = parent
+
+    # 4. CWD fallback
+    return hashlib.md5(str(cwd).encode()).hexdigest()[:8]
 
 
 def _preferred_port(key: str) -> int:
@@ -46,7 +78,6 @@ def _preferred_port(key: str) -> int:
 def _state_path(_feedback_dir: Path = None) -> Path:
     _GLOBAL_STATE_DIR.mkdir(exist_ok=True)
     return _GLOBAL_STATE_DIR / f'{_project_key()}.json'
-    return _GLOBAL_STATE_DIR / _STATE_FILE
 
 
 def _read_state(_feedback_dir: Path = None):
