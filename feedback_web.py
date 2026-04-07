@@ -22,15 +22,18 @@ _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
 _PREFERRED_PORT = 17104  # 優先使用固定 port，daemon 重啟後仍是同一 URL
 
+# State file 放在 home 目錄，不受 CWD 影響（跨 terminal/VSCode 對話共用同一 daemon）
+_GLOBAL_STATE_DIR = Path.home() / '.feedback_plus'
 
 
-def _state_path(feedback_dir: Path) -> Path:
-    return feedback_dir / _STATE_FILE
+def _state_path(_feedback_dir: Path = None) -> Path:
+    _GLOBAL_STATE_DIR.mkdir(exist_ok=True)
+    return _GLOBAL_STATE_DIR / _STATE_FILE
 
 
-def _read_state(feedback_dir: Path):
+def _read_state(_feedback_dir: Path = None):
     try:
-        p = _state_path(feedback_dir)
+        p = _state_path()
         if p.exists():
             return json.loads(p.read_text('utf-8'))
     except Exception:
@@ -38,9 +41,9 @@ def _read_state(feedback_dir: Path):
     return None
 
 
-def _write_state(feedback_dir: Path, port: int, token: str,
+def _write_state(_feedback_dir: Path, port: int, token: str,
                  instance_id: str) -> None:
-    _state_path(feedback_dir).write_text(
+    _state_path().write_text(
         json.dumps({'port': port, 'token': token,
                     'instance_id': instance_id}),
         'utf-8',
@@ -94,7 +97,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     feedback_dir = Path.cwd() / 'feedback'
     feedback_dir.mkdir(exist_ok=True)
 
-    state = _read_state(feedback_dir)
+    state = _read_state()
     port, token = None, None
     is_reuse = False
 
