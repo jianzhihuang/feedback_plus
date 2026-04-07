@@ -151,7 +151,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     feedback_dir = Path.cwd() / 'feedback'
     feedback_dir.mkdir(exist_ok=True)
 
-    # 預先計算 key（含 TTY），確保 client 與 daemon 使用同一個 key
+    # 預先計算 key，確保 client 與 daemon 使用同一個 key
     my_key = _project_key()
 
     state = _read_state()
