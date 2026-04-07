@@ -267,6 +267,7 @@ def _run_daemon(feedback_dir: Path) -> None:
     .summary-box{{margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f2f8fd 100%);white-space:pre-wrap;word-break:break-word;line-height:1.7}}
     textarea{{width:100%;min-height:340px;margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#ffffff 0%,#f8fbfe 100%);font:inherit;font-size:15px;line-height:1.7;color:var(--text);resize:vertical;outline:none}}
     textarea:focus{{border-color:rgba(31,105,159,.55);box-shadow:0 0 0 4px rgba(31,105,159,.12)}}
+    textarea:disabled{{border-color:#d7e3ef !important;box-shadow:none !important;opacity:.55;cursor:not-allowed;color:var(--muted);background:linear-gradient(180deg,#f6f8fa 0%,#f0f4f8 100%)}}
     .dropzone{{margin-top:14px;padding:18px;border-radius:20px;border:1.5px dashed #aac0d5;background:linear-gradient(180deg,#fbfdff 0%,#f3f8fc 100%)}}
     .dropzone.dragover{{border-color:var(--accent);background:linear-gradient(180deg,#eff7fe 0%,#e4f1fb 100%)}}
     .buttons,.actions{{display:flex;flex-wrap:wrap;gap:10px}}
@@ -459,6 +460,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         const payload = await resp.json();
         if (!resp.ok || !payload.ok) throw new Error(payload.error || "提交失敗");
         state.finished = true;
+        textInput.blur();
         doneBox.classList.add("show");
         doneBox.innerHTML = `<strong>已提交完成。</strong><br>共送出 ${{payload.count}} 項回饋。終端已收到結果，等待下一次 AI 呼叫時此頁面會自動重置。`;
         updateStatus(`提交完成，共 ${{payload.count}} 項回饋`);
@@ -475,6 +477,7 @@ def _run_daemon(feedback_dir: Path) -> None:
           body: JSON.stringify({{ session_id: currentSessionId }})
         }});
         state.finished = true;
+        textInput.blur();
         doneBox.classList.add("show");
         doneBox.innerHTML = "<strong>已取消。</strong><br>等待下一次 AI 呼叫時此頁面會自動重置。";
         updateStatus("已取消回饋");
