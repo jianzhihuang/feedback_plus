@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AI反馈工具 - 阻塞版本
-完全抑制stderr输出，包括libpng警告
+AI回饋工具 - 阻塞版本
+完全抑制stderr輸出，包括libpng警告
 """
 
 import sys
@@ -9,11 +9,11 @@ import os
 import subprocess
 
 def main():
-    # 构建命令
+    # 建構命令
     script_path = os.path.join(os.path.dirname(__file__), 'ai_feedback_tool_simple.py')
     cmd = [sys.executable, script_path] + sys.argv[1:]
     
-    # 正常情况下保持安静；如果子进程失败，再把真实错误打印出来
+    # 正常情況下保持安靜；如果子程序失敗，再把真實錯誤印出來
     result = subprocess.run(
         cmd,
         stderr=subprocess.PIPE,
@@ -26,7 +26,7 @@ def main():
         if result.stderr:
             sys.stderr.write(result.stderr)
         else:
-            sys.stderr.write("ai_feedback_tool_simple.py 执行失败，但没有返回可见错误信息。\n")
+            sys.stderr.write("ai_feedback_tool_simple.py 執行失敗，但沒有返回可見錯誤資訊。\n")
     
     return result.returncode
 

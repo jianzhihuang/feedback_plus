@@ -432,22 +432,22 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 
     def save_image_from_payload(image_payload) -> str:
         if not isinstance(image_payload, dict):
-            raise ValueError('图片资料格式错误')
+            raise ValueError('圖片資料格式錯誤')
 
         data_url = image_payload.get('data_url', '')
         filename = image_payload.get('name', '')
         mime_type = image_payload.get('mime_type', '')
 
         if not isinstance(data_url, str) or not data_url.startswith('data:image/'):
-            raise ValueError('图片资料不是有效的 data URL')
+            raise ValueError('圖片資料不是有效的 data URL')
 
         try:
             header, encoded = data_url.split(',', 1)
         except ValueError as exc:
-            raise ValueError('图片资料损坏') from exc
+            raise ValueError('圖片資料損毀') from exc
 
         if ';base64' not in header:
-            raise ValueError('图片资料不是 base64 编码')
+            raise ValueError('圖片資料不是 base64 編碼')
 
         if not mime_type:
             mime_type = header[5:].split(';')[0].strip().lower()
@@ -455,7 +455,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
         try:
             raw_bytes = base64.b64decode(encoded, validate=True)
         except ValueError as exc:
-            raise ValueError('图片 base64 解码失败') from exc
+            raise ValueError('圖片 base64 解碼失敗') from exc
 
         image_path = next_image_path(filename, mime_type)
         image_path.write_bytes(raw_bytes)
@@ -497,7 +497,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
             try:
                 payload = json.loads(body.decode('utf-8'))
             except json.JSONDecodeError:
-                self.send_json(400, {'ok': False, 'error': 'JSON 格式错误'})
+                self.send_json(400, {'ok': False, 'error': 'JSON 格式錯誤'})
                 return
 
             if self.path == '/api/submit':
@@ -505,10 +505,10 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
                 images = payload.get('images', [])
 
                 if not isinstance(images, list):
-                    self.send_json(400, {'ok': False, 'error': 'images 必须是列表'})
+                    self.send_json(400, {'ok': False, 'error': 'images 必須是清單'})
                     return
                 if not text and not images:
-                    self.send_json(400, {'ok': False, 'error': '请提供反馈内容'})
+                    self.send_json(400, {'ok': False, 'error': '請提供回饋內容'})
                     return
 
                 feedback_items = []
@@ -524,7 +524,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
                     self.send_json(400, {'ok': False, 'error': str(exc)})
                     return
                 except OSError as exc:
-                    self.send_json(500, {'ok': False, 'error': f'保存图片失败: {exc}'})
+                    self.send_json(500, {'ok': False, 'error': f'儲存圖片失敗: {exc}'})
                     return
 
                 if text:
@@ -556,7 +556,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 
     url = f'http://127.0.0.1:{server.server_port}/'
     if not open_feedback_page(url):
-        print(f'请在浏览器打开反馈页面: {url}')
+        print(f'請在瀏覽器開啟回饋頁面: {url}')
 
     timed_out = False
     try:
