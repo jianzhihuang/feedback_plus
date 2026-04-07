@@ -21,13 +21,6 @@ _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
 
 
-def _session_key() -> str:
-    """回傳當前終端 session 的穩定識別鍵（client 端計算）。"""
-    try:
-        return str(os.getsid(os.getpid()))
-    except AttributeError:  # Windows
-        return str(os.getppid())
-
 
 def _state_path(feedback_dir: Path) -> Path:
     return feedback_dir / _STATE_FILE
@@ -44,10 +37,10 @@ def _read_state(feedback_dir: Path):
 
 
 def _write_state(feedback_dir: Path, port: int, token: str,
-                 session_key: str, instance_id: str) -> None:
+                 instance_id: str) -> None:
     _state_path(feedback_dir).write_text(
         json.dumps({'port': port, 'token': token,
-                    'session_key': session_key, 'instance_id': instance_id}),
+                    'instance_id': instance_id}),
         'utf-8',
     )
 
@@ -99,13 +92,12 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     feedback_dir = Path.cwd() / 'feedback'
     feedback_dir.mkdir(exist_ok=True)
 
-    key = _session_key()
     state = _read_state(feedback_dir)
     port, token = None, None
     is_reuse = False
 
-    # 嘗試複用同 session 的既有伺服器
-    if state and state.get('session_key') == key:
+    # daemon 存活就直接複用（不比對 session_key，因為各工具呼叫的 SID 不穩定）
+    if state:
         p, t = state.get('port', 0), state.get('token', '')
         if p and t and _alive(p):
             try:
@@ -116,7 +108,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
                 port = None
 
     if port is None:
-        port, token = _spawn_daemon(feedback_dir, key)
+        port, token = _spawn_daemon(feedback_dir)
 
     # 啟動新一輪回饋（取得 session_id）
     try:
@@ -143,7 +135,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 
 # ── Client internals ───────────────────────────────────────────────────────────
 
-def _spawn_daemon(feedback_dir: Path, session_key: str):
+def _spawn_daemon(feedback_dir: Path):
     """啟動獨立 daemon 伺服器，回傳 (port, token)。"""
     try:
         _state_path(feedback_dir).unlink()
@@ -155,7 +147,6 @@ def _spawn_daemon(feedback_dir: Path, session_key: str):
         str(Path(__file__).resolve()),
         '--daemon',
         '--feedback-dir', str(feedback_dir),
-        '--session-key', session_key,
     ]
     kw = {
         'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
@@ -171,7 +162,7 @@ def _spawn_daemon(feedback_dir: Path, session_key: str):
     deadline = time.monotonic() + _DAEMON_STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         s = _read_state(feedback_dir)
-        if s and s.get('session_key') == session_key:
+        if s:
             p, t = s.get('port', 0), s.get('token', '')
             if p and t and _alive(p):
                 return p, t
@@ -202,7 +193,7 @@ def _wait_result(port: int, token: str, timeout: int, session_id: str) -> list:
 
 # ── Server (daemon) ────────────────────────────────────────────────────────────
 
-def _run_daemon(feedback_dir: Path, session_key: str) -> None:
+def _run_daemon(feedback_dir: Path) -> None:
     """作為持久化 HTTP daemon 執行。透過 --daemon flag 呼叫。"""
     token = str(uuid.uuid4())
     instance_id = str(uuid.uuid4())
@@ -711,7 +702,7 @@ def _run_daemon(feedback_dir: Path, session_key: str) -> None:
     # ── 啟動伺服器 ──────────────────────────────────────────────────────────────
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True
-    _write_state(feedback_dir, server.server_port, token, session_key, instance_id)
+    _write_state(feedback_dir, server.server_port, token, instance_id)
     server.serve_forever()
 
 
@@ -721,10 +712,9 @@ def _cli_main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--feedback-dir', type=Path)
-    parser.add_argument('--session-key', type=str)
     args, _ = parser.parse_known_args()
-    if args.daemon and args.feedback_dir and args.session_key:
-        _run_daemon(args.feedback_dir, args.session_key)
+    if args.daemon and args.feedback_dir:
+        _run_daemon(args.feedback_dir)
 
 
 if __name__ == '__main__':
