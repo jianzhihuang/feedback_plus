@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
-_HISTORY_FILE = '.feedback_history.json'
+# History filename is now computed per-session in _run_daemon() using the project key.
 _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
 
@@ -340,19 +340,18 @@ def _wait_result(port: int, token: str, timeout: int, session_id: str) -> list:
 
 # ── History persistence ────────────────────────────────────────────────────────
 
-def _load_history(feedback_dir: Path) -> list:
+def _load_history(history_path: Path) -> list:
     try:
-        p = feedback_dir / _HISTORY_FILE
-        if p.exists():
-            return json.loads(p.read_text('utf-8'))
+        if history_path.exists():
+            return json.loads(history_path.read_text('utf-8'))
     except Exception:
         pass
     return []
 
 
-def _save_history(feedback_dir: Path, history: list) -> None:
+def _save_history(history_path: Path, history: list) -> None:
     try:
-        (feedback_dir / _HISTORY_FILE).write_text(
+        history_path.write_text(
             json.dumps(history, ensure_ascii=False, indent=2), 'utf-8')
     except Exception:
         pass
@@ -364,6 +363,8 @@ def _run_daemon(feedback_dir: Path) -> None:
     """作為持久化 HTTP daemon 執行。透過 --daemon flag 呼叫。"""
     token = str(uuid.uuid4())
     instance_id = str(uuid.uuid4())
+    # Per-session history file: different terminal windows keep separate records
+    history_path = feedback_dir / f'.feedback_history_{_project_key()}.json'
 
     shared = {
         'lock': threading.Lock(),
@@ -372,7 +373,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         'status': 'idle',   # idle | active | done
         'feedback': [],
         'results': {},       # {session_id: (feedback_list, expiry_time)}
-        'history': _load_history(feedback_dir),  # 從檔案載入歷史
+        'history': _load_history(history_path),  # 從 session-aware 檔案載入歷史
         'image_counter': 0,
         'timeout': 0,        # 本輪 timeout 秒數（0=無限制）
         'pending_queue': [],  # [{sid, summary, timeout}] — 多 session 排隊
@@ -434,7 +435,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         with shared['lock']:
             shared['history'].append(entry)
             h_copy = list(shared['history'])
-        _save_history(feedback_dir, h_copy)
+        _save_history(history_path, h_copy)
 
     # ── HTML builder ───────────────────────────────────────────────────────────
     def build_page() -> str:
