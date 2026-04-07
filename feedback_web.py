@@ -509,6 +509,7 @@ def _run_daemon(feedback_dir: Path, session_key: str) -> None:
     }}
 
     setInterval(async () => {{
+      if (document.hidden) return;  // tab 在背景時暫停輪詢
       try {{
         const resp = await fetch('/api/session-info', {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
         if (!resp.ok) return;
