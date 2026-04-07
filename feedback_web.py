@@ -20,6 +20,7 @@ _STATE_FILE = '.feedback_server.json'
 _HISTORY_FILE = '.feedback_history.json'
 _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
+_PREFERRED_PORT = 17104  # 優先使用固定 port，daemon 重啟後仍是同一 URL
 
 
 
@@ -858,8 +859,11 @@ def _run_daemon(feedback_dir: Path) -> None:
 
             self.send_json(404, {'ok': False, 'error': 'Not found'})
 
-    # ── 啟動伺服器 ──────────────────────────────────────────────────────────────
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    # ── 啟動伺服器（優先固定 port，被佔用則 fallback 隨機）──────────────────────
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', _PREFERRED_PORT), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True
     _write_state(feedback_dir, server.server_port, token, instance_id)
     server.serve_forever()
