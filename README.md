@@ -246,37 +246,51 @@ python ai_feedback_tool_blocking.py --gui --summary "AI任務摘要" --timeout 9
 
 ## 💡 為什麼選擇 CLI 而非 MCP？
 
-本工具早期曾以 MCP（Model Context Protocol）方式整合，後改為 **Shell CLI 呼叫**。原因如下：
+本工具早期曾以 MCP（Model Context Protocol）方式整合，後改為 **Shell CLI 呼叫**。以下說明設計決策依據。
 
-### MCP 的 Token 消耗問題
+### MCP vs CLI 全面比較
 
-MCP 整合時，AI 每次對話開始都必須將**所有工具的 schema 定義**載入 context window：
+| 面向 | MCP | CLI (Shell) |
+|------|-----|-------------|
+| **Schema 預載** | ✗ 所有工具定義塞入 context（可達數萬 token） | ✅ 無需預載 |
+| **每次呼叫 overhead** | JSON-RPC 包裝（`jsonrpc`, `id`, `method`, `params`） | 純 stdout 文字 |
+| **10 次呼叫消耗** | ~600 tokens（含 schema 可達數萬） | ~300 tokens |
+| **Schema 定義消耗** | 6 server × 10 工具 ≈ **47,000 tokens** | 0 tokens |
+| **IDE 設定需求** | 需設定 MCP server | 無需任何設定 |
+| **適合場景** | 長期 orchestrator 流程、結構化輸出 | 高頻呼叫、一次性查詢、子代理任務 |
+| **對高頻工具效益** | 低（每次對話都重新載入 schema） | **高（token 持續節省）** |
 
-```
-6 個 MCP server × 10 個工具 ≈ 47,000 tokens（尚未做任何事）
-```
+### 研究與實測數據
 
-加上每次工具呼叫的 JSON-RPC 協議包裝：
+> "MCP for long-lived orchestrator flows, CLI for sub-agents and quick one-shot jobs. Claude handled typed args way better over MCP, while CLI was nicer when I needed pipes, grep, or jq in the middle."
+>
+> — [MCP vs CLI for AI Agent Tools: When to Use Which?](https://docs.bswen.com/blog/2026-03-17-mcp-vs-cli-when-to-use/) (BSWEN, 2026)
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"...","arguments":{...}}}
-```
+---
 
-| 方式 | 10 次工具呼叫 token 消耗 |
-|------|--------------------------|
-| MCP  | ~600 tokens（含 schema 預載可達數萬） |
-| CLI  | ~300 tokens |
+> "6 MCP servers, 60 tools → ~47,000 tokens. After dynamic discovery → ~400 tokens. That is a 99% reduction in MCP-related token usage."
+>
+> — [Introducing MCP CLI: A way to call MCP Servers Efficiently](https://www.philschmid.de/mcp-cli) (Philipp Schmid, 2026)
 
-Vercel 工程師實測：將 MCP 工具換成 bash + filesystem，**每次呼叫費用從 $1.00 降至 $0.25（省 75%）**。
+---
 
-### CLI 的優勢
+> "The Vercel team figured this out when rebuilding their internal agents. They replaced most of their custom tooling with just two things: a filesystem tool and a bash tool. Their sales call summarization agent dropped from around $1.00 per call to about $0.25 on Claude Opus. And the output quality improved."
+>
+> — [Why Your AI Agents Need a Shell](https://dev.to/salahpichen/why-your-ai-agents-need-a-shell-and-how-to-give-them-one-safely-3jj8) (Salah Pichen, 2025)
 
-- ✅ **零 schema 預載**：不需預先定義工具格式
-- ✅ **只有 stdout 計入 token**：沒有 JSON-RPC wrapper overhead
-- ✅ **對高頻呼叫工具效益最大**：feedback_plus 是反覆呼叫的工具，每次省下的 token 持續累積
-- ✅ **無需 IDE 設定**：任何能執行 shell 的 AI 環境均可使用
+---
 
-> **結論**：對於 feedback_plus 這種需要在對話中反覆呼叫的工具，CLI 方式在 token 效率上遠優於 MCP。
+> "Every MCP tool call dumps raw data into your 200K context window. Context Mode spawns isolated subprocesses — only stdout enters context."
+>
+> — [MCP server that reduces Claude Code context consumption by 98%](https://news.ycombinator.com/item?id=47193064) (Hacker News, 2025)
+
+### 結論
+
+對於 feedback_plus 這種需要在對話中**反覆呼叫**的工具，CLI 方式在 token 效率上遠優於 MCP：
+- ✅ 零 schema 預載：不需預先定義工具格式
+- ✅ 只有 stdout 計入 token：沒有 JSON-RPC wrapper overhead
+- ✅ 對高頻呼叫工具效益最大：每次省下的 token 持續累積
+- ✅ 無需 IDE 設定：任何能執行 shell 的 AI 環境均可使用
 
 ---
 
