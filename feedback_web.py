@@ -1,10 +1,14 @@
+import argparse
 import base64
 import json
 import mimetypes
 import os
+import socket
 import subprocess
 import sys
 import threading
+import time
+import uuid
 import webbrowser
 from datetime import datetime
 from html import escape
@@ -12,6 +16,62 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+_STATE_FILE = '.feedback_server.json'
+_DAEMON_STARTUP_TIMEOUT = 5.0
+_RESULT_TTL = 120.0  # 結果保留秒數（防競態）
+
+
+def _session_key() -> str:
+    """回傳當前終端 session 的穩定識別鍵（client 端計算）。"""
+    try:
+        return str(os.getsid(os.getpid()))
+    except AttributeError:  # Windows
+        return str(os.getppid())
+
+
+def _state_path(feedback_dir: Path) -> Path:
+    return feedback_dir / _STATE_FILE
+
+
+def _read_state(feedback_dir: Path):
+    try:
+        p = _state_path(feedback_dir)
+        if p.exists():
+            return json.loads(p.read_text('utf-8'))
+    except Exception:
+        pass
+    return None
+
+
+def _write_state(feedback_dir: Path, port: int, token: str,
+                 session_key: str, instance_id: str) -> None:
+    _state_path(feedback_dir).write_text(
+        json.dumps({'port': port, 'token': token,
+                    'session_key': session_key, 'instance_id': instance_id}),
+        'utf-8',
+    )
+
+
+def _alive(port: int) -> bool:
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _request(port: int, token: str, method: str, path: str, body=None) -> dict:
+    import http.client
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    headers = {'X-Daemon-Token': token}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers['Content-Type'] = 'application/json'
+    conn.request(method, path, body=data, headers=headers)
+    result = json.loads(conn.getresponse().read())
+    conn.close()
+    return result
 
 
 def open_feedback_page(url: str) -> bool:
@@ -27,73 +87,222 @@ def open_feedback_page(url: str) -> bool:
         return False
 
 
+# ── Public API ─────────────────────────────────────────────────────────────────
+
 def collect_feedback_web(summary: str = '', timeout: int = 600):
+    """
+    收集使用者回饋 - Web模式（持久化伺服器）
+
+    同一 terminal session 複用同一個 port，瀏覽器 tab 自動重置表單，
+    不會每次開啟新的 port 或新的 tab。
+    """
     feedback_dir = Path.cwd() / 'feedback'
     feedback_dir.mkdir(exist_ok=True)
 
-    result_holder = {'feedback': []}
-    done_event = threading.Event()
-    counter_lock = threading.Lock()
-    image_counter = 0
+    key = _session_key()
+    state = _read_state(feedback_dir)
+    port, token = None, None
+    is_reuse = False
 
-    def build_feedback_page() -> str:
-        summary_section = ''
+    # 嘗試複用同 session 的既有伺服器
+    if state and state.get('session_key') == key:
+        p, t = state.get('port', 0), state.get('token', '')
+        if p and t and _alive(p):
+            try:
+                _request(p, t, 'GET', '/api/ping')
+                port, token = p, t
+                is_reuse = True
+            except Exception:
+                port = None
+
+    if port is None:
+        port, token = _spawn_daemon(feedback_dir, key)
+
+    # 啟動新一輪回饋（取得 session_id）
+    try:
+        resp = _request(port, token, 'POST', '/api/new-session', {'summary': summary})
+        session_id = resp['session_id']
+    except Exception as exc:
+        raise RuntimeError(f'無法連線至回饋伺服器: {exc}')
+
+    url = f'http://127.0.0.1:{port}/'
+    if not is_reuse:
+        # 第一次：開啟瀏覽器
+        if not open_feedback_page(url):
+            print(f'請在瀏覽器開啟回饋頁面: {url}')
+    else:
+        # 複用：瀏覽器 tab 透過 JS 輪詢自動重置，僅在 macOS 嘗試 focus
+        if sys.platform == 'darwin':
+            try:
+                subprocess.Popen(['open', url])
+            except Exception:
+                pass
+
+    return _wait_result(port, token, timeout, session_id)
+
+
+# ── Client internals ───────────────────────────────────────────────────────────
+
+def _spawn_daemon(feedback_dir: Path, session_key: str):
+    """啟動獨立 daemon 伺服器，回傳 (port, token)。"""
+    try:
+        _state_path(feedback_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        '--daemon',
+        '--feedback-dir', str(feedback_dir),
+        '--session-key', session_key,
+    ]
+    kw = {
+        'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
+        'stdin': subprocess.DEVNULL, 'close_fds': True,
+    }
+    if os.name == 'nt':
+        kw['creationflags'] = 0x00000008  # DETACHED_PROCESS
+    else:
+        kw['start_new_session'] = True
+
+    subprocess.Popen(cmd, **kw)
+
+    deadline = time.monotonic() + _DAEMON_STARTUP_TIMEOUT
+    while time.monotonic() < deadline:
+        s = _read_state(feedback_dir)
+        if s and s.get('session_key') == session_key:
+            p, t = s.get('port', 0), s.get('token', '')
+            if p and t and _alive(p):
+                return p, t
+        time.sleep(0.1)
+
+    raise RuntimeError('回饋伺服器啟動逾時（5 秒）')
+
+
+def _wait_result(port: int, token: str, timeout: int, session_id: str) -> list:
+    """輪詢直到伺服器有此 session 的結果。"""
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+    while True:
+        if deadline and time.monotonic() > deadline:
+            try:
+                _request(port, token, 'POST', '/api/cancel',
+                         {'session_id': session_id})
+            except Exception:
+                pass
+            return []
+        try:
+            r = _request(port, token, 'GET', f'/api/result/{session_id}')
+            if r.get('ready'):
+                return r.get('feedback', [])
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
+# ── Server (daemon) ────────────────────────────────────────────────────────────
+
+def _run_daemon(feedback_dir: Path, session_key: str) -> None:
+    """作為持久化 HTTP daemon 執行。透過 --daemon flag 呼叫。"""
+    token = str(uuid.uuid4())
+    instance_id = str(uuid.uuid4())
+
+    shared = {
+        'lock': threading.Lock(),
+        'session_id': '',
+        'summary': '',
+        'status': 'idle',   # idle | active | done
+        'feedback': [],
+        'results': {},       # {session_id: (feedback_list, expiry_time)}
+        'image_counter': 0,
+    }
+
+    def reset_session(summary: str) -> str:
+        sid = str(uuid.uuid4())
+        with shared['lock']:
+            shared['session_id'] = sid
+            shared['summary'] = summary
+            shared['status'] = 'active'
+            shared['feedback'] = []
+        return sid
+
+    def store_result(sid: str, feedback: list) -> None:
+        now = time.monotonic()
+        with shared['lock']:
+            shared['results'][sid] = (feedback, now + _RESULT_TTL)
+            # 清除過期結果
+            shared['results'] = {
+                k: v for k, v in shared['results'].items() if v[1] > now
+            }
+
+    # ── HTML builder ───────────────────────────────────────────────────────────
+    def build_page() -> str:
+        with shared['lock']:
+            summary = shared['summary']
+            sess_id = shared['session_id']
+
+        fb_dir_esc = escape(str(feedback_dir.resolve()))
+        fb_dir_json = json.dumps(str(feedback_dir.resolve()), ensure_ascii=False)
+        tok_json = json.dumps(token)
+        sid_json = json.dumps(sess_id)
+
+        summary_html = ''
         if summary:
-            summary_section = f'''
-            <section class="panel summary">
-              <div class="section-title">AI 工作摘要</div>
-              <div class="summary-box">{escape(summary)}</div>
-            </section>
-            '''
+            summary_html = (
+                '<section class="panel summary">'
+                '<div class="section-title">AI 工作摘要</div>'
+                f'<div class="summary-box">{escape(summary)}</div>'
+                '</section>'
+            )
 
-        template = """<!doctype html>
+        return f"""<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Feedback</title>
   <style>
-    :root{--bg:#f4f8fc;--panel:#ffffffee;--line:#d6e0ea;--text:#17324d;--muted:#60758a;--accent:#1f699f;--danger:#bc4e57;--shadow:0 20px 40px rgba(18,54,86,.12)}
-    *{box-sizing:border-box}
-    body{margin:0;font-family:"Aptos","Segoe UI","PingFang TC","Microsoft JhengHei UI",sans-serif;color:var(--text);background:radial-gradient(circle at top left,rgba(58,128,184,.18),transparent 24%),linear-gradient(180deg,#fbfdff 0%,var(--bg) 100%)}
-    .page{max-width:1120px;margin:0 auto;padding:24px}
-    .hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}
-    .hero{padding:28px;background:linear-gradient(135deg,#13324c 0%,#1f699f 72%,#56a1d2 100%);color:#fff}
-    .hero h1{margin:14px 0 10px;font-size:clamp(30px,5vw,44px);line-height:1.05;letter-spacing:-.03em}
-    .hero p{margin:0;max-width:760px;line-height:1.7;color:rgba(255,255,255,.84)}
-    .eyebrow{display:inline-block;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.15);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
-    .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
-    .chip{padding:10px 14px;border-radius:999px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.12);font-size:13px}
-    .stack{display:grid;gap:16px;margin-top:18px}
-    .grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:16px}
-    .panel{padding:20px}
-    .section-title{font-size:22px;font-weight:700;letter-spacing:-.02em}
-    .sub{margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6}
-    .summary-box{margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f2f8fd 100%);white-space:pre-wrap;word-break:break-word;line-height:1.7}
-    textarea{width:100%;min-height:340px;margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#ffffff 0%,#f8fbfe 100%);font:inherit;font-size:15px;line-height:1.7;color:var(--text);resize:vertical;outline:none}
-    textarea:focus{border-color:rgba(31,105,159,.55);box-shadow:0 0 0 4px rgba(31,105,159,.12)}
-    .dropzone{margin-top:14px;padding:18px;border-radius:20px;border:1.5px dashed #aac0d5;background:linear-gradient(180deg,#fbfdff 0%,#f3f8fc 100%)}
-    .dropzone.dragover{border-color:var(--accent);background:linear-gradient(180deg,#eff7fe 0%,#e4f1fb 100%)}
-    .buttons,.actions{display:flex;flex-wrap:wrap;gap:10px}
-    .buttons{margin-top:14px}
-    button{appearance:none;border:none;border-radius:999px;padding:12px 18px;font:inherit;font-size:14px;cursor:pointer;transition:transform .15s ease}
-    button:hover{transform:translateY(-1px)}
-    button:disabled{opacity:.65;cursor:not-allowed;transform:none}
-    .primary{background:linear-gradient(135deg,var(--accent) 0%,#2f79b4 100%);color:#fff}
-    .secondary{background:#fff;color:var(--text);border:1px solid #d7e3ef}
-    .danger{background:linear-gradient(135deg,var(--danger) 0%,#d3626a 100%);color:#fff}
-    .hidden{display:none}
-    .attachments{display:grid;gap:10px;margin-top:16px}
-    .empty,.attachment,.status,.done{padding:16px;border-radius:16px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f4f8fc 100%)}
-    .empty,.meta{color:var(--muted);font-size:14px;line-height:1.6}
-    .attachment{display:flex;justify-content:space-between;gap:12px;align-items:center}
-    .name{display:block;font-weight:700;word-break:break-all}
-    .meta{margin-top:4px;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
-    .remove{background:#fff;color:var(--danger);border:1px solid rgba(188,78,87,.24)}
-    .status,.done{line-height:1.7}
-    .done{display:none;background:linear-gradient(135deg,#eef8ff 0%,#f9fcff 100%)}
-    .done.show{display:block}
-    @media (max-width:900px){.grid{grid-template-columns:1fr}textarea{min-height:240px}}
+    :root{{--bg:#f4f8fc;--panel:#ffffffee;--line:#d6e0ea;--text:#17324d;--muted:#60758a;--accent:#1f699f;--danger:#bc4e57;--shadow:0 20px 40px rgba(18,54,86,.12)}}
+    *{{box-sizing:border-box}}
+    body{{margin:0;font-family:"Aptos","Segoe UI","PingFang TC","Microsoft JhengHei UI",sans-serif;color:var(--text);background:radial-gradient(circle at top left,rgba(58,128,184,.18),transparent 24%),linear-gradient(180deg,#fbfdff 0%,var(--bg) 100%)}}
+    .page{{max-width:1120px;margin:0 auto;padding:24px}}
+    .hero,.panel{{background:var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}}
+    .hero{{padding:28px;background:linear-gradient(135deg,#13324c 0%,#1f699f 72%,#56a1d2 100%);color:#fff}}
+    .hero h1{{margin:14px 0 10px;font-size:clamp(30px,5vw,44px);line-height:1.05;letter-spacing:-.03em}}
+    .hero p{{margin:0;max-width:760px;line-height:1.7;color:rgba(255,255,255,.84)}}
+    .eyebrow{{display:inline-block;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.15);font-size:12px;letter-spacing:.08em;text-transform:uppercase}}
+    .chips{{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}}
+    .chip{{padding:10px 14px;border-radius:999px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.12);font-size:13px}}
+    .stack{{display:grid;gap:16px;margin-top:18px}}
+    .grid{{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:16px}}
+    .panel{{padding:20px}}
+    .section-title{{font-size:22px;font-weight:700;letter-spacing:-.02em}}
+    .sub{{margin-top:6px;color:var(--muted);font-size:13px;line-height:1.6}}
+    .summary-box{{margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f2f8fd 100%);white-space:pre-wrap;word-break:break-word;line-height:1.7}}
+    textarea{{width:100%;min-height:340px;margin-top:14px;padding:18px;border-radius:18px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#ffffff 0%,#f8fbfe 100%);font:inherit;font-size:15px;line-height:1.7;color:var(--text);resize:vertical;outline:none}}
+    textarea:focus{{border-color:rgba(31,105,159,.55);box-shadow:0 0 0 4px rgba(31,105,159,.12)}}
+    .dropzone{{margin-top:14px;padding:18px;border-radius:20px;border:1.5px dashed #aac0d5;background:linear-gradient(180deg,#fbfdff 0%,#f3f8fc 100%)}}
+    .dropzone.dragover{{border-color:var(--accent);background:linear-gradient(180deg,#eff7fe 0%,#e4f1fb 100%)}}
+    .buttons,.actions{{display:flex;flex-wrap:wrap;gap:10px}}
+    .buttons{{margin-top:14px}}
+    button{{appearance:none;border:none;border-radius:999px;padding:12px 18px;font:inherit;font-size:14px;cursor:pointer;transition:transform .15s ease}}
+    button:hover{{transform:translateY(-1px)}}
+    button:disabled{{opacity:.65;cursor:not-allowed;transform:none}}
+    .primary{{background:linear-gradient(135deg,var(--accent) 0%,#2f79b4 100%);color:#fff}}
+    .secondary{{background:#fff;color:var(--text);border:1px solid #d7e3ef}}
+    .danger{{background:linear-gradient(135deg,var(--danger) 0%,#d3626a 100%);color:#fff}}
+    .hidden{{display:none}}
+    .attachments{{display:grid;gap:10px;margin-top:16px}}
+    .empty,.attachment,.status,.done{{padding:16px;border-radius:16px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f4f8fc 100%)}}
+    .empty,.meta{{color:var(--muted);font-size:14px;line-height:1.6}}
+    .attachment{{display:flex;justify-content:space-between;gap:12px;align-items:center}}
+    .name{{display:block;font-weight:700;word-break:break-all}}
+    .meta{{margin-top:4px;font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
+    .remove{{background:#fff;color:var(--danger);border:1px solid rgba(188,78,87,.24)}}
+    .status,.done{{line-height:1.7}}
+    .done{{display:none;background:linear-gradient(135deg,#eef8ff 0%,#f9fcff 100%)}}
+    .done.show{{display:block}}
+    @media (max-width:900px){{.grid{{grid-template-columns:1fr}}textarea{{min-height:240px}}}}
   </style>
 </head>
 <body>
@@ -110,14 +319,13 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
     </section>
 
     <div class="stack">
-      __SUMMARY_SECTION__
+      <div id="summarySlot">{summary_html}</div>
       <section class="grid">
         <section class="panel">
           <div class="section-title">文字回饋</div>
           <div class="sub">可以直接描述問題、補充需求，或告訴 AI 下一步要做什麼。</div>
           <textarea id="feedbackText" placeholder="輸入你的回饋內容..."></textarea>
         </section>
-
         <section class="panel">
           <div class="section-title">圖片回饋</div>
           <div class="sub">支援拖曳、上傳與剪貼簿貼上。剛截圖的話，直接 Ctrl/Cmd + V 即可。</div>
@@ -134,10 +342,9 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
           </div>
         </section>
       </section>
-
       <section class="panel">
         <div class="status" id="statusText">等待提交回饋</div>
-        <div class="sub" id="statusHint">快捷鍵：Ctrl/Cmd + Enter 提交，Ctrl/Cmd + V 貼上圖片。圖片會儲存到 __FEEDBACK_DIR__。</div>
+        <div class="sub" id="statusHint">快捷鍵：Ctrl/Cmd + Enter 提交，Ctrl/Cmd + V 貼上圖片。圖片會儲存到 {fb_dir_esc}。</div>
         <div class="done" id="doneBox"></div>
         <div class="actions" style="margin-top:16px">
           <button class="primary" id="submitButton" type="button">提交給 AI</button>
@@ -148,275 +355,204 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
   </main>
 
   <script>
-    const timeoutSeconds = __TIMEOUT__;
-    const feedbackDir = __FEEDBACK_DIR_JSON__;
-    const textInput = document.getElementById("feedbackText");
-    const fileInput = document.getElementById("fileInput");
+    const TOKEN = {tok_json};
+    const FEEDBACK_DIR = {fb_dir_json};
+    let currentSessionId = {sid_json};
+
+    const textInput    = document.getElementById("feedbackText");
+    const fileInput    = document.getElementById("fileInput");
     const uploadButton = document.getElementById("uploadButton");
-    const pasteButton = document.getElementById("pasteButton");
+    const pasteButton  = document.getElementById("pasteButton");
     const submitButton = document.getElementById("submitButton");
     const cancelButton = document.getElementById("cancelButton");
     const attachmentList = document.getElementById("attachmentList");
-    const statusText = document.getElementById("statusText");
-    const statusHint = document.getElementById("statusHint");
-    const countChip = document.getElementById("countChip");
-    const doneBox = document.getElementById("doneBox");
-    const dropzone = document.getElementById("dropzone");
+    const statusText   = document.getElementById("statusText");
+    const statusHint   = document.getElementById("statusHint");
+    const countChip    = document.getElementById("countChip");
+    const doneBox      = document.getElementById("doneBox");
+    const dropzone     = document.getElementById("dropzone");
+    const summarySlot  = document.getElementById("summarySlot");
 
-    const state = { attachments: [], busy: false, finished: false };
+    const state = {{ attachments: [], busy: false, finished: false }};
 
-    function feedbackCount() {
+    function h(s) {{
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }}
+
+    function feedbackCount() {{
       return state.attachments.length + (textInput.value.trim() ? 1 : 0);
-    }
+    }}
 
-    function updateStatus(message = "等待提交回饋") {
-      countChip.textContent = `目前 ${feedbackCount()} 項回饋`;
+    function updateStatus(message = "等待提交回饋") {{
+      countChip.textContent = `目前 ${{feedbackCount()}} 項回饋`;
       statusText.textContent = message;
-      if (!state.finished) {
-        statusHint.textContent = `快捷鍵：Ctrl/Cmd + Enter 提交，Ctrl/Cmd + V 貼上圖片。圖片會儲存到 ${feedbackDir}`;
-      }
+      statusHint.textContent = `快捷鍵：Ctrl/Cmd + Enter 提交，Ctrl/Cmd + V 貼上圖片。圖片會儲存到 ${{FEEDBACK_DIR}}`;
       submitButton.disabled = state.busy || state.finished || feedbackCount() === 0;
       uploadButton.disabled = state.busy || state.finished;
-      pasteButton.disabled = state.busy || state.finished;
+      pasteButton.disabled  = state.busy || state.finished;
       cancelButton.disabled = state.busy || state.finished;
-      textInput.disabled = state.finished;
-    }
+      textInput.disabled    = state.finished;
+    }}
 
-    function setBusy(flag) {
-      state.busy = flag;
-      updateStatus(statusText.textContent);
-    }
+    function setBusy(flag) {{ state.busy = flag; updateStatus(statusText.textContent); }}
 
-    function renderAttachments() {
-      if (!state.attachments.length) {
+    function renderAttachments() {{
+      if (!state.attachments.length) {{
         attachmentList.innerHTML = '<div class="empty">目前還沒有圖片。你可以拖曳、選檔，或直接貼上截圖。</div>';
-        updateStatus();
-        return;
-      }
-
+        updateStatus(); return;
+      }}
       attachmentList.innerHTML = "";
-      state.attachments.forEach((item) => {
+      state.attachments.forEach((item) => {{
         const row = document.createElement("div");
         row.className = "attachment";
-        row.innerHTML = `
-          <div>
-            <span class="name">${item.name}</span>
-            <div class="meta">${item.source === "paste" ? "clipboard paste" : "local upload"}</div>
-          </div>
-          <button type="button" class="remove">移除</button>
-        `;
-        row.querySelector(".remove").addEventListener("click", () => {
-          state.attachments = state.attachments.filter((entry) => entry.id !== item.id);
-          renderAttachments();
-          updateStatus("已移除圖片");
-        });
+        row.innerHTML = `<div><span class="name">${{item.name}}</span><div class="meta">${{item.source === "paste" ? "clipboard paste" : "local upload"}}</div></div><button type="button" class="remove">移除</button>`;
+        row.querySelector(".remove").addEventListener("click", () => {{
+          state.attachments = state.attachments.filter((e) => e.id !== item.id);
+          renderAttachments(); updateStatus("已移除圖片");
+        }});
         attachmentList.appendChild(row);
-      });
-
+      }});
       updateStatus();
-    }
+    }}
 
-    function addFiles(files, source) {
-      const validFiles = Array.from(files || []).filter((file) => file && file.type && file.type.startsWith("image/"));
-      if (!validFiles.length) {
-        updateStatus("沒有偵測到可加入的圖片");
-        return;
-      }
-
+    function addFiles(files, source) {{
+      const valid = Array.from(files || []).filter((f) => f && f.type && f.type.startsWith("image/"));
+      if (!valid.length) {{ updateStatus("沒有偵測到可加入的圖片"); return; }}
       const now = Date.now();
-      validFiles.forEach((file, index) => {
-        const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
-        state.attachments.push({
-          id: `${now}-${index}-${Math.random().toString(16).slice(2)}`,
-          file,
-          source,
-          name: file.name || `image-${now}-${index + 1}.${ext}`
-        });
-      });
+      valid.forEach((file, i) => {{
+        const ext = (file.type.split("/")[1] || "png").replace("jpeg","jpg");
+        state.attachments.push({{ id:`${{now}}-${{i}}-${{Math.random().toString(16).slice(2)}}`, file, source, name: file.name || `image-${{now}}-${{i+1}}.${{ext}}` }});
+      }});
+      renderAttachments(); updateStatus(`已加入 ${{valid.length}} 張圖片`);
+    }}
 
-      renderAttachments();
-      updateStatus(`已加入 ${validFiles.length} 張圖片`);
-    }
+    function fileToDataUrl(file) {{
+      return new Promise((res, rej) => {{
+        const r = new FileReader();
+        r.onload  = () => res({{ name: file.name, mime_type: file.type, data_url: r.result }});
+        r.onerror = () => rej(new Error(`無法讀取檔案：${{file.name}}`));
+        r.readAsDataURL(file);
+      }});
+    }}
 
-    function fileToDataUrl(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve({
-          name: file.name,
-          mime_type: file.type,
-          data_url: reader.result
-        });
-        reader.onerror = () => reject(new Error(`無法讀取檔案：${file.name}`));
-        reader.readAsDataURL(file);
-      });
-    }
-
-    async function readClipboardImages() {
-      if (!navigator.clipboard || !navigator.clipboard.read) {
-        updateStatus("這個瀏覽器不支援按鈕讀取剪貼簿，請直接按 Ctrl/Cmd + V");
-        return;
-      }
-
-      try {
+    async function readClipboardImages() {{
+      if (!navigator.clipboard?.read) {{ updateStatus("這個瀏覽器不支援按鈕讀取剪貼簿，請直接按 Ctrl/Cmd + V"); return; }}
+      try {{
         const items = await navigator.clipboard.read();
-        const files = [];
-        let index = 0;
-        for (const item of items) {
-          for (const type of item.types) {
-            if (!type.startsWith("image/")) {
-              continue;
-            }
+        const files = []; let idx = 0;
+        for (const item of items) {{
+          for (const type of item.types) {{
+            if (!type.startsWith("image/")) continue;
             const blob = await item.getType(type);
-            const ext = (type.split("/")[1] || "png").replace("jpeg", "jpg");
-            files.push(new File([blob], `clipboard-${Date.now()}-${index + 1}.${ext}`, { type }));
-            index += 1;
-          }
-        }
-
-        if (!files.length) {
-          updateStatus("剪貼簿裡沒有圖片");
-          return;
-        }
-
+            const ext = (type.split("/")[1] || "png").replace("jpeg","jpg");
+            files.push(new File([blob], `clipboard-${{Date.now()}}-${{++idx}}.${{ext}}`, {{ type }}));
+          }}
+        }}
+        if (!files.length) {{ updateStatus("剪貼簿裡沒有圖片"); return; }}
         addFiles(files, "paste");
-      } catch (error) {
-        updateStatus("無法直接讀取剪貼簿，請改用 Ctrl/Cmd + V 貼上圖片");
-      }
-    }
+      }} catch (_) {{ updateStatus("無法直接讀取剪貼簿，請改用 Ctrl/Cmd + V 貼上圖片"); }}
+    }}
 
-    async function submitFeedback() {
-      if (state.busy || state.finished) {
-        return;
-      }
+    function apiHeaders() {{
+      return {{ 'Content-Type': 'application/json', 'X-Daemon-Token': TOKEN }};
+    }}
 
+    async function submitFeedback() {{
+      if (state.busy || state.finished) return;
       const text = textInput.value.trim();
-      if (!text && !state.attachments.length) {
-        updateStatus("請先輸入文字或加入圖片");
-        return;
-      }
-
-      setBusy(true);
-      updateStatus("正在提交回饋...");
-
-      try {
+      if (!text && !state.attachments.length) {{ updateStatus("請先輸入文字或加入圖片"); return; }}
+      setBusy(true); updateStatus("正在提交回饋...");
+      try {{
         const images = await Promise.all(
-          state.attachments.map((item) => fileToDataUrl(item.file).then((payload) => ({ ...payload, source: item.source })))
+          state.attachments.map((item) => fileToDataUrl(item.file).then((p) => ({{ ...p, source: item.source }})))
         );
-        const response = await fetch("/api/submit", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, images })
-        });
-        const payload = await response.json();
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.error || "提交失敗");
-        }
-
+        const resp = await fetch("/api/submit", {{
+          method: "POST", headers: apiHeaders(),
+          body: JSON.stringify({{ session_id: currentSessionId, text, images }})
+        }});
+        const payload = await resp.json();
+        if (!resp.ok || !payload.ok) throw new Error(payload.error || "提交失敗");
         state.finished = true;
         doneBox.classList.add("show");
-        doneBox.innerHTML = `<strong>已提交完成。</strong><br>共送出 ${payload.count} 項回饋。終端已收到結果，這個頁面現在可以直接關閉。`;
-        updateStatus(`提交完成，共 ${payload.count} 項回饋`);
-      } catch (error) {
-        updateStatus(`提交失敗：${error.message}`);
-      } finally {
-        setBusy(false);
-      }
-    }
+        doneBox.innerHTML = `<strong>已提交完成。</strong><br>共送出 ${{payload.count}} 項回饋。終端已收到結果，等待下一次 AI 呼叫時此頁面會自動重置。`;
+        updateStatus(`提交完成，共 ${{payload.count}} 項回饋`);
+      }} catch (e) {{ updateStatus(`提交失敗：${{e.message}}`); }}
+      finally {{ setBusy(false); }}
+    }}
 
-    async function cancelFeedback() {
-      if (state.busy || state.finished) {
-        return;
-      }
-
-      setBusy(true);
-      updateStatus("正在取消...");
-      try {
-        await fetch("/api/cancel", { method: "POST" });
+    async function cancelFeedback() {{
+      if (state.busy || state.finished) return;
+      setBusy(true); updateStatus("正在取消...");
+      try {{
+        await fetch("/api/cancel", {{
+          method: "POST", headers: apiHeaders(),
+          body: JSON.stringify({{ session_id: currentSessionId }})
+        }});
         state.finished = true;
         doneBox.classList.add("show");
-        doneBox.innerHTML = "<strong>已取消。</strong><br>這次沒有送出任何回饋，終端會收到取消結果。";
+        doneBox.innerHTML = "<strong>已取消。</strong><br>等待下一次 AI 呼叫時此頁面會自動重置。";
         updateStatus("已取消回饋");
-      } catch (error) {
-        updateStatus("取消失敗，請重新嘗試");
-      } finally {
-        setBusy(false);
-      }
-    }
+      }} catch (e) {{ updateStatus("取消失敗，請重新嘗試"); }}
+      finally {{ setBusy(false); }}
+    }}
 
-    document.addEventListener("paste", (event) => {
-      const files = Array.from(event.clipboardData?.items || [])
-        .filter((item) => item.type && item.type.startsWith("image/"))
-        .map((item) => item.getAsFile())
-        .filter(Boolean);
-      if (!files.length) {
-        return;
-      }
-      event.preventDefault();
-      addFiles(files, "paste");
-    });
+    // ── Session polling：偵測 AI 新一輪呼叫，自動重置表單 ──────────────────────
+    function resetForm(summary) {{
+      state.attachments = []; state.busy = false; state.finished = false;
+      textInput.value = ''; textInput.disabled = false;
+      doneBox.classList.remove('show'); doneBox.innerHTML = '';
+      renderAttachments(); updateStatus('等待提交回饋');
+      summarySlot.innerHTML = summary
+        ? `<section class="panel summary"><div class="section-title">AI 工作摘要</div><div class="summary-box">${{h(summary)}}</div></section>`
+        : '';
+      textInput.focus();
+    }}
 
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-        event.preventDefault();
-        submitFeedback();
-      }
-    });
+    setInterval(async () => {{
+      try {{
+        const resp = await fetch('/api/session-info', {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.session_id !== currentSessionId) {{
+          currentSessionId = data.session_id;
+          resetForm(data.summary || '');
+        }}
+      }} catch (_) {{}}
+    }}, 1500);
+    // ─────────────────────────────────────────────────────────────────────────
 
+    document.addEventListener("paste", (ev) => {{
+      const files = Array.from(ev.clipboardData?.items || [])
+        .filter((i) => i.type?.startsWith("image/")).map((i) => i.getAsFile()).filter(Boolean);
+      if (!files.length) return;
+      ev.preventDefault(); addFiles(files, "paste");
+    }});
+    document.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {{ ev.preventDefault(); submitFeedback(); }}
+    }});
     textInput.addEventListener("input", () => updateStatus());
     uploadButton.addEventListener("click", () => fileInput.click());
-    fileInput.addEventListener("change", () => {
-      addFiles(fileInput.files, "upload");
-      fileInput.value = "";
-    });
+    fileInput.addEventListener("change", () => {{ addFiles(fileInput.files, "upload"); fileInput.value = ""; }});
     pasteButton.addEventListener("click", readClipboardImages);
     submitButton.addEventListener("click", submitFeedback);
     cancelButton.addEventListener("click", cancelFeedback);
-
-    dropzone.addEventListener("dragover", (event) => {
-      event.preventDefault();
-      dropzone.classList.add("dragover");
-    });
+    dropzone.addEventListener("dragover", (ev) => {{ ev.preventDefault(); dropzone.classList.add("dragover"); }});
     dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
-    dropzone.addEventListener("drop", (event) => {
-      event.preventDefault();
-      dropzone.classList.remove("dragover");
-      addFiles(event.dataTransfer?.files, "upload");
-    });
+    dropzone.addEventListener("drop", (ev) => {{
+      ev.preventDefault(); dropzone.classList.remove("dragover");
+      addFiles(ev.dataTransfer?.files, "upload");
+    }});
 
-    if (timeoutSeconds > 0) {
-      const deadline = Date.now() + timeoutSeconds * 1000;
-      window.setInterval(() => {
-        if (state.finished) {
-          return;
-        }
-        const remaining = Math.max(0, Math.floor((deadline - Date.now()) / 1000));
-        const minutes = Math.floor(remaining / 60);
-        const seconds = remaining % 60;
-        statusHint.textContent = `快捷鍵：Ctrl/Cmd + Enter 提交，Ctrl/Cmd + V 貼上圖片。剩餘等待時間 ${minutes}:${String(seconds).padStart(2, "0")}，圖片會儲存到 ${feedbackDir}`;
-      }, 1000);
-    }
-
-    textInput.focus();
-    updateStatus();
+    textInput.focus(); updateStatus();
   </script>
 </body>
-</html>
-"""
+</html>"""
 
-        return (
-            template
-            .replace('__SUMMARY_SECTION__', summary_section)
-            .replace('__TIMEOUT__', str(max(int(timeout), 0)))
-            .replace('__FEEDBACK_DIR__', escape(str(feedback_dir.resolve())))
-            .replace('__FEEDBACK_DIR_JSON__', json.dumps(str(feedback_dir.resolve()), ensure_ascii=False))
-        )
-
+    # ── Image helpers ──────────────────────────────────────────────────────────
     def next_image_path(filename: str, mime_type: str) -> Path:
-        nonlocal image_counter
-        with counter_lock:
-            image_counter += 1
-            index = image_counter
-
+        with shared['lock']:
+            shared['image_counter'] += 1
+            index = shared['image_counter']
         suffix = Path(filename or '').suffix.lower()
         if suffix == '.jpe':
             suffix = '.jpg'
@@ -426,148 +562,169 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
             suffix = '.jpg'
         if suffix not in ALLOWED_IMAGE_EXTENSIONS:
             suffix = '.png'
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return feedback_dir / f'feedback_image_{ts}_{index}{suffix}'
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return feedback_dir / f'feedback_image_{timestamp}_{index}{suffix}'
-
-    def save_image_from_payload(image_payload) -> str:
-        if not isinstance(image_payload, dict):
+    def save_image(payload) -> str:
+        if not isinstance(payload, dict):
             raise ValueError('圖片資料格式錯誤')
-
-        data_url = image_payload.get('data_url', '')
-        filename = image_payload.get('name', '')
-        mime_type = image_payload.get('mime_type', '')
-
+        data_url = payload.get('data_url', '')
         if not isinstance(data_url, str) or not data_url.startswith('data:image/'):
             raise ValueError('圖片資料不是有效的 data URL')
-
         try:
             header, encoded = data_url.split(',', 1)
         except ValueError as exc:
             raise ValueError('圖片資料損毀') from exc
-
         if ';base64' not in header:
             raise ValueError('圖片資料不是 base64 編碼')
-
-        if not mime_type:
-            mime_type = header[5:].split(';')[0].strip().lower()
-
+        mime = payload.get('mime_type') or header[5:].split(';')[0].strip().lower()
         try:
-            raw_bytes = base64.b64decode(encoded, validate=True)
+            raw = base64.b64decode(encoded, validate=True)
         except ValueError as exc:
             raise ValueError('圖片 base64 解碼失敗') from exc
+        path = next_image_path(payload.get('name', ''), mime)
+        path.write_bytes(raw)
+        return str(path.resolve())
 
-        image_path = next_image_path(filename, mime_type)
-        image_path.write_bytes(raw_bytes)
-        return str(image_path.resolve())
-
-    class FeedbackRequestHandler(BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
+    # ── HTTP Handler ───────────────────────────────────────────────────────────
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
             return
 
-        def send_json(self, status_code: int, payload):
-            payload_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-            self.send_response(status_code)
+        def _auth(self) -> bool:
+            return self.headers.get('X-Daemon-Token') == token
+
+        def send_json(self, code, payload):
+            data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            self.send_response(code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(payload_bytes)))
+            self.send_header('Content-Length', str(len(data)))
             self.end_headers()
-            self.wfile.write(payload_bytes)
+            self.wfile.write(data)
 
         def do_GET(self):
-            if self.path in {'/', '/index.html'}:
-                page_bytes = build_feedback_page().encode('utf-8')
+            if self.path in ('/', '/index.html'):
+                page = build_page().encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.send_header('Content-Length', str(len(page_bytes)))
+                self.send_header('Content-Length', str(len(page)))
                 self.end_headers()
-                self.wfile.write(page_bytes)
+                self.wfile.write(page)
                 return
-
             if self.path == '/favicon.ico':
                 self.send_response(204)
                 self.end_headers()
                 return
-
+            if not self._auth():
+                self.send_json(403, {'ok': False, 'error': 'Forbidden'})
+                return
+            if self.path == '/api/ping':
+                self.send_json(200, {'ok': True, 'instance_id': instance_id})
+                return
+            if self.path == '/api/session-info':
+                with shared['lock']:
+                    self.send_json(200, {
+                        'session_id': shared['session_id'],
+                        'summary': shared['summary'],
+                        'status': shared['status'],
+                    })
+                return
+            if self.path.startswith('/api/result/'):
+                sid = self.path[len('/api/result/'):]
+                with shared['lock']:
+                    if sid in shared['results']:
+                        fb, _ = shared['results'][sid]
+                        self.send_json(200, {'ready': True, 'feedback': fb})
+                        return
+                    if shared['session_id'] == sid and shared['status'] == 'done':
+                        self.send_json(200, {'ready': True, 'feedback': shared['feedback']})
+                        return
+                self.send_json(200, {'ready': False})
+                return
             self.send_json(404, {'ok': False, 'error': 'Not found'})
 
         def do_POST(self):
-            content_length = int(self.headers.get('Content-Length', '0'))
-            body = self.rfile.read(content_length) if content_length else b'{}'
-
+            if not self._auth():
+                self.send_json(403, {'ok': False, 'error': 'Forbidden'})
+                return
+            length = int(self.headers.get('Content-Length', '0'))
+            body = self.rfile.read(length) if length else b'{}'
             try:
                 payload = json.loads(body.decode('utf-8'))
             except json.JSONDecodeError:
                 self.send_json(400, {'ok': False, 'error': 'JSON 格式錯誤'})
                 return
 
+            if self.path == '/api/new-session':
+                sid = reset_session(str(payload.get('summary', '')))
+                self.send_json(200, {'ok': True, 'session_id': sid})
+                return
+
             if self.path == '/api/submit':
+                caller_sid = payload.get('session_id', '')
+                with shared['lock']:
+                    if shared['session_id'] != caller_sid or shared['status'] != 'active':
+                        self.send_json(409, {'ok': False, 'error': '會話已過期，請等待 AI 下次呼叫'})
+                        return
                 text = str(payload.get('text', '')).strip()
                 images = payload.get('images', [])
-
                 if not isinstance(images, list):
                     self.send_json(400, {'ok': False, 'error': 'images 必須是清單'})
                     return
                 if not text and not images:
                     self.send_json(400, {'ok': False, 'error': '請提供回饋內容'})
                     return
-
-                feedback_items = []
+                items = []
                 try:
-                    for image_payload in images:
-                        saved_path = save_image_from_payload(image_payload)
-                        feedback_items.append({
-                            'type': 'image',
-                            'content': saved_path,
-                            'timestamp': datetime.now().isoformat()
-                        })
+                    for img in images:
+                        items.append({'type': 'image', 'content': save_image(img),
+                                      'timestamp': datetime.now().isoformat()})
                 except ValueError as exc:
                     self.send_json(400, {'ok': False, 'error': str(exc)})
                     return
                 except OSError as exc:
                     self.send_json(500, {'ok': False, 'error': f'儲存圖片失敗: {exc}'})
                     return
-
                 if text:
-                    feedback_items.append({
-                        'type': 'text',
-                        'content': text,
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-                result_holder['feedback'] = feedback_items
-                done_event.set()
-                self.send_json(200, {'ok': True, 'count': len(feedback_items)})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    items.append({'type': 'text', 'content': text,
+                                  'timestamp': datetime.now().isoformat()})
+                with shared['lock']:
+                    shared['feedback'] = items
+                    shared['status'] = 'done'
+                store_result(caller_sid, items)
+                self.send_json(200, {'ok': True, 'count': len(items)})
                 return
 
             if self.path == '/api/cancel':
-                result_holder['feedback'] = []
-                done_event.set()
+                caller_sid = payload.get('session_id', '')
+                with shared['lock']:
+                    if shared['session_id'] == caller_sid and shared['status'] == 'active':
+                        shared['feedback'] = []
+                        shared['status'] = 'done'
+                store_result(caller_sid, [])
                 self.send_json(200, {'ok': True})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
 
             self.send_json(404, {'ok': False, 'error': 'Not found'})
 
-    server = ThreadingHTTPServer(('127.0.0.1', 0), FeedbackRequestHandler)
+    # ── 啟動伺服器 ──────────────────────────────────────────────────────────────
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
+    _write_state(feedback_dir, server.server_port, token, session_key, instance_id)
+    server.serve_forever()
 
-    url = f'http://127.0.0.1:{server.server_port}/'
-    if not open_feedback_page(url):
-        print(f'請在瀏覽器開啟回饋頁面: {url}')
 
-    timed_out = False
-    try:
-        if timeout and timeout > 0:
-            timed_out = not done_event.wait(timeout)
-        else:
-            done_event.wait()
-    finally:
-        if timed_out or server_thread.is_alive():
-            server.shutdown()
-        server_thread.join(timeout=1)
-        server.server_close()
+# ── Entry point ────────────────────────────────────────────────────────────────
 
-    return result_holder['feedback']
+def _cli_main() -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--daemon', action='store_true')
+    parser.add_argument('--feedback-dir', type=Path)
+    parser.add_argument('--session-key', type=str)
+    args, _ = parser.parse_known_args()
+    if args.daemon and args.feedback_dir and args.session_key:
+        _run_daemon(args.feedback_dir, args.session_key)
+
+
+if __name__ == '__main__':
+    _cli_main()
