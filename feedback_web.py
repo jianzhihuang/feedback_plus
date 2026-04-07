@@ -113,7 +113,7 @@ def collect_feedback_web(summary: str = '', timeout: int = 600):
 
     # 啟動新一輪回饋（取得 session_id）
     try:
-        resp = _request(port, token, 'POST', '/api/new-session', {'summary': summary})
+        resp = _request(port, token, 'POST', '/api/new-session', {'summary': summary, 'timeout': timeout})
         session_id = resp['session_id']
     except Exception as exc:
         raise RuntimeError(f'無法連線至回饋伺服器: {exc}')
@@ -223,15 +223,17 @@ def _run_daemon(feedback_dir: Path) -> None:
         'results': {},       # {session_id: (feedback_list, expiry_time)}
         'history': _load_history(feedback_dir),  # 從檔案載入歷史
         'image_counter': 0,
+        'timeout': 0,        # 本輪 timeout 秒數（0=無限制）
     }
 
-    def reset_session(summary: str) -> str:
+    def reset_session(summary: str, timeout: int = 0) -> str:
         sid = str(uuid.uuid4())
         with shared['lock']:
             shared['session_id'] = sid
             shared['summary'] = summary
             shared['status'] = 'active'
             shared['feedback'] = []
+            shared['timeout'] = max(0, int(timeout))
         return sid
 
     def store_result(sid: str, feedback: list) -> None:
@@ -429,16 +431,23 @@ def _run_daemon(feedback_dir: Path) -> None:
 
     // ── Wait timer ────────────────────────────────────────────────────────────
     let _timerInterval = null;
-    function startTimer() {{
-      let start = Date.now();
-      waitTimer.classList.remove('hidden');
+    function startTimer(timeoutSec) {{
       clearInterval(_timerInterval);
-      _timerInterval = setInterval(() => {{
-        const s = Math.floor((Date.now() - start) / 1000);
-        const mm = String(Math.floor(s / 60)).padStart(2, '0');
-        const ss = String(s % 60).padStart(2, '0');
-        waitTimer.textContent = `⏱ 等待 ${{mm}}:${{ss}}`;
-      }}, 500);
+      if (!timeoutSec || timeoutSec <= 0) {{ waitTimer.classList.add('hidden'); return; }}
+      let remaining = timeoutSec;
+      waitTimer.classList.remove('hidden');
+      function tick() {{
+        const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
+        const ss = String(remaining % 60).padStart(2, '0');
+        waitTimer.textContent = `⏱ 剩餘 ${{mm}}:${{ss}}`;
+        if (remaining <= 0) {{
+          clearInterval(_timerInterval);
+          cancelFeedback();
+        }}
+        remaining--;
+      }}
+      tick();
+      _timerInterval = setInterval(tick, 1000);
     }}
     function stopTimer() {{
       clearInterval(_timerInterval);
@@ -613,7 +622,7 @@ def _run_daemon(feedback_dir: Path) -> None:
     }}
 
     // ── Session polling：偵測 AI 新一輪呼叫，自動重置表單 ──────────────────────
-    function resetForm(summary) {{
+    function resetForm(summary, timeoutSec) {{
       state.attachments = []; state.busy = false; state.finished = false;
       textInput.value = ''; textInput.disabled = false;
       doneBox.classList.remove('show'); doneBox.innerHTML = '';
@@ -624,12 +633,18 @@ def _run_daemon(feedback_dir: Path) -> None:
       // 自動切回摘要 tab
       tabSummary.classList.add('tab-active'); tabHistory.classList.remove('tab-active');
       summaryContent.classList.remove('hidden'); historyContent.classList.add('hidden');
-      startTimer();
+      startTimer(timeoutSec || 0);
       textInput.focus();
     }}
 
-    // 頁面載入時若 session 已啟動，立即開始計時
-    if (currentSessionId) startTimer();
+    // 頁面載入時若 session 已啟動，從 session-info 取得 timeout 開始倒數
+    (async () => {{
+      if (!currentSessionId) return;
+      try {{
+        const resp = await fetch('/api/session-info', {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
+        if (resp.ok) {{ const d = await resp.json(); startTimer(d.timeout || 0); }}
+      }} catch(_) {{}}
+    }})();
 
     setInterval(async () => {{
       if (document.hidden) return;  // tab 在背景時暫停輪詢
@@ -639,7 +654,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         const data = await resp.json();
         if (data.session_id !== currentSessionId) {{
           currentSessionId = data.session_id;
-          resetForm(data.summary || '');
+          resetForm(data.summary || '', data.timeout || 0);
         }}
       }} catch (_) {{}}
     }}, 1500);
@@ -751,6 +766,7 @@ def _run_daemon(feedback_dir: Path) -> None:
                         'session_id': shared['session_id'],
                         'summary': shared['summary'],
                         'status': shared['status'],
+                        'timeout': shared['timeout'],
                     })
                 return
             if self.path == '/api/history':
@@ -785,7 +801,7 @@ def _run_daemon(feedback_dir: Path) -> None:
                 return
 
             if self.path == '/api/new-session':
-                sid = reset_session(str(payload.get('summary', '')))
+                sid = reset_session(str(payload.get('summary', '')), payload.get('timeout', 0))
                 self.send_json(200, {'ok': True, 'session_id': sid})
                 return
 
