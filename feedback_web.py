@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -16,18 +17,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
-_STATE_FILE = '.feedback_server.json'
 _HISTORY_FILE = '.feedback_history.json'
 _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
-_PREFERRED_PORT = 17104  # 優先使用固定 port，daemon 重啟後仍是同一 URL
 
-# State file 放在 home 目錄，不受 CWD 影響（跨 terminal/VSCode 對話共用同一 daemon）
+# State file 放在 home 目錄，每個專案獨立一份（以 git root hash 區隔）
 _GLOBAL_STATE_DIR = Path.home() / '.feedback_plus'
+
+
+def _project_key() -> str:
+    """以 git root（或 CWD）的 hash 作為專案識別碼，確保同專案共用同一 daemon。"""
+    try:
+        r = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, timeout=2,
+        )
+        root = r.stdout.strip() if r.returncode == 0 else str(Path.cwd())
+    except Exception:
+        root = str(Path.cwd())
+    return hashlib.md5(root.encode()).hexdigest()[:8]
+
+
+def _preferred_port(key: str) -> int:
+    """每個專案有一致的 port（17100–17999），重啟後仍是同一 URL。"""
+    return 17100 + (int(key, 16) % 900)
 
 
 def _state_path(_feedback_dir: Path = None) -> Path:
     _GLOBAL_STATE_DIR.mkdir(exist_ok=True)
+    return _GLOBAL_STATE_DIR / f'{_project_key()}.json'
     return _GLOBAL_STATE_DIR / _STATE_FILE
 
 
@@ -864,7 +882,7 @@ def _run_daemon(feedback_dir: Path) -> None:
 
     # ── 啟動伺服器（優先固定 port，被佔用則 fallback 隨機）──────────────────────
     try:
-        server = ThreadingHTTPServer(('127.0.0.1', _PREFERRED_PORT), Handler)
+        server = ThreadingHTTPServer(('127.0.0.1', _preferred_port(_project_key())), Handler)
     except OSError:
         server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True
