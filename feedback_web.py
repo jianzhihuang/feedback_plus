@@ -17,6 +17,7 @@ from pathlib import Path
 
 ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
 _STATE_FILE = '.feedback_server.json'
+_HISTORY_FILE = '.feedback_history.json'
 _DAEMON_STARTUP_TIMEOUT = 5.0
 _RESULT_TTL = 120.0  # 結果保留秒數（防競態）
 
@@ -186,6 +187,26 @@ def _wait_result(port: int, token: str, timeout: int, session_id: str) -> list:
         time.sleep(0.5)
 
 
+# ── History persistence ────────────────────────────────────────────────────────
+
+def _load_history(feedback_dir: Path) -> list:
+    try:
+        p = feedback_dir / _HISTORY_FILE
+        if p.exists():
+            return json.loads(p.read_text('utf-8'))
+    except Exception:
+        pass
+    return []
+
+
+def _save_history(feedback_dir: Path, history: list) -> None:
+    try:
+        (feedback_dir / _HISTORY_FILE).write_text(
+            json.dumps(history, ensure_ascii=False, indent=2), 'utf-8')
+    except Exception:
+        pass
+
+
 # ── Server (daemon) ────────────────────────────────────────────────────────────
 
 def _run_daemon(feedback_dir: Path) -> None:
@@ -200,7 +221,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         'status': 'idle',   # idle | active | done
         'feedback': [],
         'results': {},       # {session_id: (feedback_list, expiry_time)}
-        'history': [],       # [{session_id, summary, feedback_text, image_count, timestamp, cancelled}]
+        'history': _load_history(feedback_dir),  # 從檔案載入歷史
         'image_counter': 0,
     }
 
@@ -230,15 +251,18 @@ def _run_daemon(feedback_dir: Path) -> None:
                 text = item['content']
             elif item['type'] == 'image':
                 img_count += 1
+        entry = {
+            'session_id': sid,
+            'summary': summary,
+            'feedback_text': text,
+            'image_count': img_count,
+            'timestamp': datetime.now().isoformat(),
+            'cancelled': cancelled,
+        }
         with shared['lock']:
-            shared['history'].append({
-                'session_id': sid,
-                'summary': summary,
-                'feedback_text': text,
-                'image_count': img_count,
-                'timestamp': datetime.now().isoformat(),
-                'cancelled': cancelled,
-            })
+            shared['history'].append(entry)
+            h_copy = list(shared['history'])
+        _save_history(feedback_dir, h_copy)
 
     # ── HTML builder ───────────────────────────────────────────────────────────
     def build_page() -> str:
@@ -319,12 +343,14 @@ def _run_daemon(feedback_dir: Path) -> None:
     .history-feedback{{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}}
     .htag{{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em}}
     .htag-done{{background:#e8f4ea;color:#2d7a3a}}.htag-cancel{{background:#fde8e8;color:#bc4e57}}
-    @media (max-width:900px){{.grid{{grid-template-columns:1fr}}textarea{{min-height:240px}}}}
+    .wait-timer{{position:absolute;top:20px;right:24px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.25);border-radius:14px;padding:10px 18px;color:#fff;font-size:14px;font-weight:600;letter-spacing:.05em;font-variant-numeric:tabular-nums}}
+    @media (max-width:900px){{.grid{{grid-template-columns:1fr}}textarea{{min-height:240px}}.wait-timer{{position:static;margin-bottom:12px;display:inline-block}}}}
   </style>
 </head>
 <body>
   <main class="page">
-    <section class="hero">
+    <section class="hero" style="position:relative">
+      <div id="waitTimer" class="wait-timer hidden"></div>
       <span class="eyebrow">AI Feedback Portal</span>
       <h1>把文字和截圖一次交給 AI</h1>
       <p>這個頁面只在本機 localhost 運作。你可以輸入文字、拖曳圖片、上傳檔案，或直接用 Ctrl/Cmd + V 貼上截圖，最後用 Ctrl/Cmd + Enter 提交。</p>
@@ -399,6 +425,25 @@ def _run_daemon(feedback_dir: Path) -> None:
     const historyContent = document.getElementById("historyContent");
     const tabSummary   = document.getElementById("tabSummary");
     const tabHistory   = document.getElementById("tabHistory");
+    const waitTimer    = document.getElementById("waitTimer");
+
+    // ── Wait timer ────────────────────────────────────────────────────────────
+    let _timerInterval = null;
+    function startTimer() {{
+      let start = Date.now();
+      waitTimer.classList.remove('hidden');
+      clearInterval(_timerInterval);
+      _timerInterval = setInterval(() => {{
+        const s = Math.floor((Date.now() - start) / 1000);
+        const mm = String(Math.floor(s / 60)).padStart(2, '0');
+        const ss = String(s % 60).padStart(2, '0');
+        waitTimer.textContent = `⏱ 等待 ${{mm}}:${{ss}}`;
+      }}, 500);
+    }}
+    function stopTimer() {{
+      clearInterval(_timerInterval);
+      waitTimer.classList.add('hidden');
+    }}
 
     // ── Tab switching ─────────────────────────────────────────────────────────
     tabSummary.addEventListener('click', () => {{
@@ -541,6 +586,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         if (!resp.ok || !payload.ok) throw new Error(payload.error || "提交失敗");
         state.finished = true;
         textInput.blur();
+        stopTimer();
         doneBox.classList.add("show");
         doneBox.innerHTML = `<strong>已提交完成。</strong><br>共送出 ${{payload.count}} 項回饋。終端已收到結果，等待下一次 AI 呼叫時此頁面會自動重置。`;
         updateStatus(`提交完成，共 ${{payload.count}} 項回饋`);
@@ -558,6 +604,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         }});
         state.finished = true;
         textInput.blur();
+        stopTimer();
         doneBox.classList.add("show");
         doneBox.innerHTML = "<strong>已取消。</strong><br>等待下一次 AI 呼叫時此頁面會自動重置。";
         updateStatus("已取消回饋");
@@ -577,8 +624,12 @@ def _run_daemon(feedback_dir: Path) -> None:
       // 自動切回摘要 tab
       tabSummary.classList.add('tab-active'); tabHistory.classList.remove('tab-active');
       summaryContent.classList.remove('hidden'); historyContent.classList.add('hidden');
+      startTimer();
       textInput.focus();
     }}
+
+    // 頁面載入時若 session 已啟動，立即開始計時
+    if (currentSessionId) startTimer();
 
     setInterval(async () => {{
       if (document.hidden) return;  // tab 在背景時暫停輪詢
