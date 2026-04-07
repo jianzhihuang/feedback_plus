@@ -200,6 +200,7 @@ def _run_daemon(feedback_dir: Path) -> None:
         'status': 'idle',   # idle | active | done
         'feedback': [],
         'results': {},       # {session_id: (feedback_list, expiry_time)}
+        'history': [],       # [{session_id, summary, feedback_text, image_count, timestamp, cancelled}]
         'image_counter': 0,
     }
 
@@ -221,6 +222,24 @@ def _run_daemon(feedback_dir: Path) -> None:
                 k: v for k, v in shared['results'].items() if v[1] > now
             }
 
+    def append_history(sid: str, summary: str, items: list, cancelled: bool) -> None:
+        text = ''
+        img_count = 0
+        for item in items:
+            if item['type'] == 'text':
+                text = item['content']
+            elif item['type'] == 'image':
+                img_count += 1
+        with shared['lock']:
+            shared['history'].append({
+                'session_id': sid,
+                'summary': summary,
+                'feedback_text': text,
+                'image_count': img_count,
+                'timestamp': datetime.now().isoformat(),
+                'cancelled': cancelled,
+            })
+
     # ── HTML builder ───────────────────────────────────────────────────────────
     def build_page() -> str:
         with shared['lock']:
@@ -232,14 +251,11 @@ def _run_daemon(feedback_dir: Path) -> None:
         tok_json = json.dumps(token)
         sid_json = json.dumps(sess_id)
 
-        summary_html = ''
-        if summary:
-            summary_html = (
-                '<section class="panel summary">'
-                '<div class="section-title">AI 工作摘要</div>'
-                f'<div class="summary-box">{escape(summary)}</div>'
-                '</section>'
-            )
+        summary_inner_html = (
+            f'<div class="summary-box">{escape(summary)}</div>'
+            if summary
+            else '<div class="no-summary">（AI 尚未提供摘要）</div>'
+        )
 
         return f"""<!doctype html>
 <html lang="zh-Hant">
@@ -289,6 +305,20 @@ def _run_daemon(feedback_dir: Path) -> None:
     .status,.done{{line-height:1.7}}
     .done{{display:none;background:linear-gradient(135deg,#eef8ff 0%,#f9fcff 100%)}}
     .done.show{{display:block}}
+    .tab-bar{{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:-20px -20px 16px;padding:12px 20px 0;background:linear-gradient(180deg,#f8fbff 0%,#f2f7fd 100%);border-radius:24px 24px 0 0}}
+    .tab{{appearance:none;border:none;background:none;padding:9px 20px;font:inherit;font-size:14px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;border-radius:8px 8px 0 0;transition:color .15s,border-color .15s}}
+    .tab:hover{{color:var(--text)}}
+    .tab.tab-active{{color:var(--accent);border-bottom-color:var(--accent)}}
+    .no-summary{{padding:14px 0;color:var(--muted);font-size:14px}}
+    .history-list{{display:grid;gap:10px;margin-top:4px}}
+    .history-empty{{color:var(--muted);font-size:14px;padding:20px 0;text-align:center}}
+    .history-entry{{padding:14px 16px;border-radius:14px;border:1px solid #d7e3ef;background:linear-gradient(180deg,#fbfdff 0%,#f4f8fc 100%);display:grid;gap:6px}}
+    .history-row{{display:flex;justify-content:space-between;align-items:center;gap:8px}}
+    .history-time{{font-size:12px;color:var(--muted);letter-spacing:.04em}}
+    .history-summary{{font-size:13px;color:var(--muted);white-space:pre-wrap;word-break:break-word;line-height:1.5;max-height:58px;overflow:hidden}}
+    .history-feedback{{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}}
+    .htag{{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em}}
+    .htag-done{{background:#e8f4ea;color:#2d7a3a}}.htag-cancel{{background:#fde8e8;color:#bc4e57}}
     @media (max-width:900px){{.grid{{grid-template-columns:1fr}}textarea{{min-height:240px}}}}
   </style>
 </head>
@@ -306,7 +336,14 @@ def _run_daemon(feedback_dir: Path) -> None:
     </section>
 
     <div class="stack">
-      <div id="summarySlot">{summary_html}</div>
+      <div class="panel" id="infoCard">
+        <div class="tab-bar">
+          <button class="tab tab-active" id="tabSummary">AI 工作摘要</button>
+          <button class="tab" id="tabHistory">📋 紀錄</button>
+        </div>
+        <div id="summaryContent">{summary_inner_html}</div>
+        <div id="historyContent" class="hidden"></div>
+      </div>
       <section class="grid">
         <section class="panel">
           <div class="section-title">文字回饋</div>
@@ -358,7 +395,50 @@ def _run_daemon(feedback_dir: Path) -> None:
     const countChip    = document.getElementById("countChip");
     const doneBox      = document.getElementById("doneBox");
     const dropzone     = document.getElementById("dropzone");
-    const summarySlot  = document.getElementById("summarySlot");
+    const summaryContent = document.getElementById("summaryContent");
+    const historyContent = document.getElementById("historyContent");
+    const tabSummary   = document.getElementById("tabSummary");
+    const tabHistory   = document.getElementById("tabHistory");
+
+    // ── Tab switching ─────────────────────────────────────────────────────────
+    tabSummary.addEventListener('click', () => {{
+      tabSummary.classList.add('tab-active'); tabHistory.classList.remove('tab-active');
+      summaryContent.classList.remove('hidden'); historyContent.classList.add('hidden');
+    }});
+    tabHistory.addEventListener('click', async () => {{
+      tabHistory.classList.add('tab-active'); tabSummary.classList.remove('tab-active');
+      historyContent.classList.remove('hidden'); summaryContent.classList.add('hidden');
+      historyContent.innerHTML = '<div class="history-empty">載入中…</div>';
+      try {{
+        const resp = await fetch('/api/history', {{ headers: {{ 'X-Daemon-Token': TOKEN }} }});
+        const data = await resp.json();
+        renderHistory(data.history || []);
+      }} catch(_) {{ historyContent.innerHTML = '<div class="history-empty">載入失敗</div>'; }}
+    }});
+    function renderHistory(entries) {{
+      if (!entries.length) {{
+        historyContent.innerHTML = '<div class="history-empty">尚無紀錄。</div>';
+        return;
+      }}
+      const items = [...entries].reverse().map(e => {{
+        const timeStr = new Date(e.timestamp).toLocaleString('zh-TW', {{hour12:false}});
+        const tag = e.cancelled
+          ? '<span class="htag htag-cancel">已取消</span>'
+          : '<span class="htag htag-done">已提交</span>';
+        const summaryPart = e.summary
+          ? `<div class="history-summary">📋 ${{h(e.summary)}}</div>` : '';
+        const imgPart = e.image_count > 0 ? ` ＋ ${{e.image_count}} 張圖片` : '';
+        const feedbackPart = e.feedback_text
+          ? `<div class="history-feedback">💬 ${{h(e.feedback_text)}}${{imgPart}}</div>`
+          : (e.image_count > 0 ? `<div class="history-feedback">🖼️ ${{e.image_count}} 張圖片</div>` : '');
+        return `<div class="history-entry">
+          <div class="history-row"><span class="history-time">${{h(timeStr)}}</span>${{tag}}</div>
+          ${{summaryPart}}${{feedbackPart}}
+        </div>`;
+      }}).join('');
+      historyContent.innerHTML = `<div class="history-list">${{items}}</div>`;
+    }}
+    // ─────────────────────────────────────────────────────────────────────────
 
     const state = {{ attachments: [], busy: false, finished: false }};
 
@@ -491,9 +571,12 @@ def _run_daemon(feedback_dir: Path) -> None:
       textInput.value = ''; textInput.disabled = false;
       doneBox.classList.remove('show'); doneBox.innerHTML = '';
       renderAttachments(); updateStatus('等待提交回饋');
-      summarySlot.innerHTML = summary
-        ? `<section class="panel summary"><div class="section-title">AI 工作摘要</div><div class="summary-box">${{h(summary)}}</div></section>`
-        : '';
+      summaryContent.innerHTML = summary
+        ? `<div class="summary-box">${{h(summary)}}</div>`
+        : '<div class="no-summary">（AI 尚未提供摘要）</div>';
+      // 自動切回摘要 tab
+      tabSummary.classList.add('tab-active'); tabHistory.classList.remove('tab-active');
+      summaryContent.classList.remove('hidden'); historyContent.classList.add('hidden');
       textInput.focus();
     }}
 
@@ -619,6 +702,11 @@ def _run_daemon(feedback_dir: Path) -> None:
                         'status': shared['status'],
                     })
                 return
+            if self.path == '/api/history':
+                with shared['lock']:
+                    h_copy = list(shared['history'])
+                self.send_json(200, {'history': h_copy})
+                return
             if self.path.startswith('/api/result/'):
                 sid = self.path[len('/api/result/'):]
                 with shared['lock']:
@@ -682,6 +770,9 @@ def _run_daemon(feedback_dir: Path) -> None:
                     shared['feedback'] = items
                     shared['status'] = 'done'
                 store_result(caller_sid, items)
+                with shared['lock']:
+                    _summary = shared['summary']
+                append_history(caller_sid, _summary, items, False)
                 self.send_json(200, {'ok': True, 'count': len(items)})
                 return
 
@@ -692,6 +783,9 @@ def _run_daemon(feedback_dir: Path) -> None:
                         shared['feedback'] = []
                         shared['status'] = 'done'
                 store_result(caller_sid, [])
+                with shared['lock']:
+                    _summary = shared['summary']
+                append_history(caller_sid, _summary, [], True)
                 self.send_json(200, {'ok': True})
                 return
 
