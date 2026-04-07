@@ -366,6 +366,15 @@ def _run_daemon(feedback_dir: Path) -> None:
     # Per-session history file: different terminal windows keep separate records
     history_path = feedback_dir / f'.feedback_history_{_project_key()}.json'
 
+    # One-time migration: seed from legacy shared history if keyed file is absent
+    if not history_path.exists():
+        legacy = feedback_dir / '.feedback_history.json'
+        if legacy.exists():
+            try:
+                history_path.write_bytes(legacy.read_bytes())
+            except Exception:
+                pass
+
     shared = {
         'lock': threading.Lock(),
         'session_id': '',
